@@ -11,10 +11,15 @@
 //! - `fixtures [crate…]`: pre-generate the ffmpeg fixture matrix of the oracle tests (runs each
 //!   crate's ignored `generate_fixtures` test, i.e. the same generators the tests use) and print
 //!   what was made, reused or skipped.
+//! - `parity [--area menus|effects|transitions] [--reference FILE] [--out FILE] [--min PERCENT]`:
+//!   measured parity of our shipped menu bar, or of the effects / transitions the Effects panel
+//!   lists, against a reference list (default: the local `plan/premiere/<area>.json`), presence and
+//!   placement reported separately (`parity.rs`, docs/gaps.md G7).
 //! - `ico <out.ico> <in.png>…`: pack PNGs into a Windows `.ico` (used by `packaging/icons.sh`).
 //! - `ci`: fmt check, clippy -D warnings, tests, layers, assets, wasm.
 
 mod ico;
+mod parity;
 mod version;
 
 use std::process::{Command, ExitCode};
@@ -29,24 +34,29 @@ const LAYERS: &[(&str, u8)] = &[
     ("color", 0),
     ("bitstream", 0),
     ("isobmff", 0),
+    ("avi", 0),
     ("matroska", 0),
     ("mxf", 0),
     ("cfb", 0),
     ("mpegts", 0),
     ("mpeg2v", 0),
     ("ac3", 0),
+    ("mpa", 0),
     ("ogg", 0),
     ("riff", 0),
     ("h264", 0),
     ("h264enc", 0),
     ("hevc", 0),
+    ("vp8", 0),
     ("vp9", 0),
     ("prores", 0),
     ("mjpeg", 0),
     ("dnx", 0),
     ("apv", 0),
+    ("dng", 0),
     ("av1", 0),
     ("aac", 0),
+    ("flac", 0),
     ("opus", 0),
     ("frame", 1),
     ("media", 1),
@@ -60,6 +70,8 @@ const LAYERS: &[(&str, u8)] = &[
     ("audio", 2),
     ("captions", 2),
     ("speech", 2),
+    ("tts", 2),
+    ("tts-text", 2),
     ("interchange", 2),
     ("render", 3),
     ("gpu", 3),
@@ -93,10 +105,11 @@ const SAME_LAYER: &[(&str, &str)] = &[
     ("scopes", "gpu"),
     ("gpu", "render"),
     ("cli", "filmcraft"),
+    ("tts", "tts-text"),
 ];
 
 /// Crates that must not appear below L5 (UI toolkits, windowing, OS audio/menus).
-const UI_ONLY: &[&str] = &["egui", "eframe", "egui-wgpu", "winit", "rfd", "cpal", "muda"];
+const UI_ONLY: &[&str] = &["craft-ui", "egui", "eframe", "egui-wgpu", "winit", "rfd", "cpal", "muda"];
 
 fn short(name: &str) -> &str {
     name.strip_prefix("filmcraft-").unwrap_or(name)
@@ -399,6 +412,7 @@ const FIXTURE_GENERATORS: &[(&str, &str)] = &[
     ("codecs", "mpeg_oracle"),
     ("mpeg2v", "oracle"),
     ("ac3", "oracle"),
+    ("mpa", "oracle"),
     ("codecs", "ogg_oracle"),
 ];
 
@@ -484,12 +498,16 @@ fn main() -> ExitCode {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             version::run(&root(), &rest.iter().map(String::as_str).collect::<Vec<_>>())
         }
+        "parity" => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            parity::run(&root(), &rest.iter().map(String::as_str).collect::<Vec<_>>())
+        }
         "ico" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             ico::run(&rest.iter().map(String::as_str).collect::<Vec<_>>())
         }
         _ => Err(
-            "usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|fixtures [crate…]|ico OUT IN…|version [set X.Y.Z]|ci|bench [args]|bench-playback [args]>"
+            "usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|fixtures [crate…]|parity [--area menus|effects|transitions] [--reference FILE] [--out FILE] [--min PERCENT]|ico OUT IN…|version [set X.Y.Z]|ci|bench [args]|bench-playback [args]>"
                 .into(),
         ),
     };
@@ -499,5 +517,27 @@ fn main() -> ExitCode {
             eprintln!("{e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    fn macos_packaging(file: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../packaging/macos").join(file);
+        // Git may check out packaging files with CRLF on Windows.
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())).replace("\r\n", "\n")
+    }
+
+    /// Voice-over recording needs both halves on macOS: the usage string (else the permission
+    /// prompt never appears) and the hardened-runtime audio-input entitlement (else the input is
+    /// blocked). Regression test for #659.
+    #[test]
+    fn macos_bundle_may_use_the_microphone() {
+        let plist = macos_packaging("Info.plist.in");
+        assert!(plist.contains("<key>NSMicrophoneUsageDescription</key>"));
+        let entitlements = macos_packaging("entitlements.plist");
+        assert!(entitlements.contains("<key>com.apple.security.device.audio-input</key>\n  <true/>"));
     }
 }

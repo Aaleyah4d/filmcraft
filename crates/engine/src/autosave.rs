@@ -392,6 +392,7 @@ impl Preferences {
         self.playback.postroll_seconds = secs(self.playback.postroll_seconds);
         self.trim.large_trim_offset = self.trim.large_trim_offset.clamp(1, 1000);
         self.labels.sanitize_labels();
+        self.appearance.sync_color_theme();
         self.version = settings::PREFS_VERSION;
     }
 
@@ -454,6 +455,12 @@ impl Preferences {
         let _: Preferences = serde_json::from_value(v.clone()).map_err(|e| format!("`{key}`: {e}"))?;
         settings::sanitize(&mut v, &Self::default().to_value());
         let mut p: Preferences = serde_json::from_value(v).map_err(|e| format!("`{key}`: {e}"))?;
+        // Old clients that set the single Color Theme still pick the theme they name (before
+        // `clamp`, which brings `colorTheme` back in line with the mode and theme choices).
+        if key == "appearance.colorTheme" {
+            let theme = p.appearance.color_theme.clone();
+            p.appearance.select_theme(&theme);
+        }
         p.clamp();
         *self = p;
         Ok(())
@@ -565,15 +572,16 @@ pub fn scan_candidates(data_dir: &Path, skip: Option<&Path>) -> Vec<RecoveryCand
         if !dir.is_dir() || Some(dir.as_path()) == skip || !lock_is_stale(&dir) {
             continue;
         }
-        let meta = fs::read(dir.join(META)).ok().and_then(|b| serde_json::from_slice::<JournalMeta>(&b).ok());
-        match meta {
-            Some(meta) if dir.join(SNAPSHOT).is_file() => {
-                out.push(RecoveryCandidate { id: e.file_name().to_string_lossy().into_owned(), dir, meta });
-            }
-            _ => {
-                let _ = fs::remove_dir_all(&dir);
-            }
+        let snap = dir.join(SNAPSHOT);
+        if !snap.is_file() {
+            // Empty leftover dirs (clean exit, or a crash before the first snapshot).
+            let _ = fs::remove_dir_all(&dir);
+            continue;
         }
+        // Keep the snapshot even when session.json is missing or unreadable: the project
+        // is still recoverable. Meta fields fall back to defaults.
+        let meta = fs::read(dir.join(META)).ok().and_then(|b| serde_json::from_slice::<JournalMeta>(&b).ok()).unwrap_or_default();
+        out.push(RecoveryCandidate { id: e.file_name().to_string_lossy().into_owned(), dir, meta });
     }
     out.sort_by(|a, b| b.meta.saved_unix.cmp(&a.meta.saved_unix).then(b.id.cmp(&a.id)));
     out

@@ -5,7 +5,7 @@
 
 use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use filmcraft_engine::project_panel::{self as pp, Card, SortSpec, ViewMode};
-use filmcraft_project::{Bin, BinEntry, ItemId, ItemKind};
+use filmcraft_project::{Bin, BinEntry, BinId, ItemId, ItemKind};
 use filmcraft_time::Tick;
 use serde_json::json;
 
@@ -156,10 +156,39 @@ pub fn click_modifiers(ui: &egui::Ui) -> egui::Modifiers {
     })
 }
 
+/// The selection after a click on `id`. Shift selects the range from `anchor` to `id` in the
+/// shown `order` (plus the current selection with Ctrl/Cmd too), Ctrl/Cmd toggles `id`, a plain
+/// click selects only `id`. Without a usable anchor Shift acts like a plain click.
+fn click_selection(current: &[ItemId], order: &[ItemId], anchor: Option<ItemId>, id: ItemId, shift: bool, command: bool) -> Vec<ItemId> {
+    if shift {
+        let pos = |x: ItemId| order.iter().position(|o| *o == x);
+        if let (Some(a), Some(b)) = (anchor.and_then(pos), pos(id)) {
+            let mut sel = if command { current.to_vec() } else { Vec::new() };
+            for i in order.get(a.min(b)..=a.max(b)).unwrap_or_default() {
+                if !sel.contains(i) {
+                    sel.push(*i);
+                }
+            }
+            return sel;
+        }
+    } else if command {
+        let mut sel = current.to_vec();
+        match sel.iter().position(|x| *x == id) {
+            Some(p) => {
+                sel.remove(p);
+            }
+            None => sel.push(id),
+        }
+        return sel;
+    }
+    vec![id]
+}
+
 /// Click / double-click / drag / context menu of an item (row, card).
 pub fn item_interactions(
     app: &mut FilmcraftApp,
     ui: &egui::Ui,
+    v: &View,
     resp: &egui::Response,
     id: ItemId,
     kind: &ItemKind,
@@ -169,15 +198,12 @@ pub fn item_interactions(
 ) {
     if resp.clicked() {
         let mods = click_modifiers(ui);
-        let mut sel = app.session.state.project_selection.clone();
-        if mods.command || mods.shift {
-            if let Some(p) = sel.iter().position(|x| *x == id) {
-                sel.remove(p);
-            } else {
-                sel.push(id);
-            }
-        } else {
-            sel = vec![id];
+        let order = if mods.shift { items_in_view(app, v, &app.ui.project_search.to_ascii_lowercase()) } else { Vec::new() };
+        let anchor = app.ui.project_panel.anchor.map(ItemId);
+        let sel = click_selection(&app.session.state.project_selection, &order, anchor, id, mods.shift, mods.command);
+        // a Shift-click keeps the anchor; a plain or Ctrl/Cmd click sets it
+        if !mods.shift {
+            app.ui.project_panel.anchor = Some(id.0);
         }
         app.ui.project_panel.selected_bin = None;
         actions.push(("project.select".into(), json!({"items": sel.iter().map(|i| i.0).collect::<Vec<_>>()})));
@@ -253,15 +279,25 @@ fn item_menu(app: &mut FilmcraftApp, ui: &mut egui::Ui, id: ItemId, kind: &ItemK
             ui.close();
         }
     }
-    ui.menu_button(tl!("Label"), |ui| {
+    let r = ui.menu_button(tl!("Label"), |ui| {
+        // the user's label names and colours, as in Edit ▸ Label (#786)
+        let labels = app.session.prefs.labels.clone();
         for l in filmcraft_project::Label::ALL {
-            if ui.button(crate::i18n::t(l.name())).clicked() {
+            if crate::menus::label_choice(ui, &mut app.auto, &labels, l, "project.itemMenu.label").clicked() {
                 actions.push(("project.select".into(), json!({"items": [id.0]})));
                 actions.push(("edit.label".into(), json!({"label": l.name()})));
                 ui.close();
             }
         }
     });
+    app.auto.add("project.itemMenu.label", r.response.rect, tl!("Label"));
+    let can_reveal = app.session.project.resolve_media(id).is_some_and(|(_, m, _)| matches!(m.media, filmcraft_project::MediaRef::File { .. }));
+    let b = ui.add_enabled(can_reveal, egui::Button::new(tl!("Reveal in Finder")));
+    app.auto.add("project.itemMenu.file.reveal", b.rect, "Reveal in Finder");
+    if b.clicked() {
+        actions.push(("file.reveal".into(), json!({"items": [id.0]})));
+        ui.close();
+    }
     if matches!(kind, ItemKind::Media(m) if matches!(m.media, filmcraft_project::MediaRef::File { .. })) {
         ui.separator();
         for (label, cmd) in [(tl!("Link Media…"), "media.linkMedia"), (tl!("Make Offline…"), "media.makeOffline")] {
@@ -311,25 +347,64 @@ fn bin_menu(app: &mut FilmcraftApp, ui: &mut egui::Ui, v: &View, bin: u64, actio
         ui.close();
     }
     if ui.button(tl!("New Bin")).clicked() {
-        actions.push(("file.newBin".into(), json!({"name": "New Bin", "parent": bin})));
+        actions.push(("file.newBin".into(), json!({"parent": bin, "panel": v.prefix})));
+        ui.close();
+    }
+    ui.separator();
+    if ui.button(tl!("Clear")).clicked() {
+        actions.push(("project.delete".into(), json!({"items": [bin]})));
         ui.close();
     }
 }
 
+/// Parameters for `project.delete`: the selected items, else the selected bin by id (the engine
+/// deletes a named bin with everything in it). `None` when nothing is selected.
+pub fn clear_params(selection: &[filmcraft_project::ItemId], selected_bin: Option<u64>) -> Option<serde_json::Value> {
+    if !selection.is_empty() {
+        return Some(json!({}));
+    }
+    selected_bin.map(|b| json!({"items": [b]}))
+}
+
 /// Drop project items dragged onto a bin: move them (the selection when the dragged item is in it).
+/// A dragged bin nests in it, unless that would put the bin inside itself.
 fn accept_bin_drop(app: &FilmcraftApp, ui: &egui::Ui, r: Rect, bin: u64, actions: &mut Actions) -> bool {
-    let Some(item) = crate::panels::dragged_project_item(ui) else { return false };
+    let items: Vec<u64> = if let Some(item) = crate::panels::dragged_project_item(ui) {
+        let sel = &app.session.state.project_selection;
+        if sel.contains(&item) { sel.iter().map(|i| i.0).collect() } else { vec![item.0] }
+    } else if let Some(dragged) = crate::panels::dragged_bin(ui) {
+        let root = &app.session.project.root;
+        if root.find_bin(BinId(dragged)).is_none_or(|d| d.find_bin(BinId(bin)).is_some()) {
+            return false;
+        }
+        vec![dragged]
+    } else {
+        return false;
+    };
     if !ui.rect_contains_pointer(r) {
         return false;
     }
     ui.painter().rect_stroke(r, 3.0, Stroke::new(1.5, app.tokens.accent), StrokeKind::Inside);
     if ui.input(|i| i.pointer.any_released()) {
-        let sel = &app.session.state.project_selection;
-        let items: Vec<u64> = if sel.contains(&item) { sel.iter().map(|i| i.0).collect() } else { vec![item.0] };
         actions.push(("project.moveToBin".into(), json!({"items": items, "bin": bin})));
         crate::panels::clear_drag(ui);
     }
     true
+}
+
+/// A bin dropped on empty space moves into the bin the view shows (out of the bin it was nested in).
+fn accept_view_drop(app: &FilmcraftApp, ui: &egui::Ui, r: Rect, v: &View, actions: &mut Actions) {
+    let Some(dragged) = crate::panels::dragged_bin(ui) else { return };
+    let root = &app.session.project.root;
+    // already shown here, or the view is inside the dragged bin
+    let here = root.find_bin(v.bin).is_some_and(|b| b.children.iter().any(|c| matches!(c, BinEntry::Bin(x) if x.id.0 == dragged)));
+    let inside = root.find_bin(BinId(dragged)).is_none_or(|d| d.find_bin(v.bin).is_some());
+    if here || inside || !ui.rect_contains_pointer(r) || !ui.input(|i| i.pointer.any_released()) {
+        return;
+    }
+    let bin = (v.bin != root.id).then_some(v.bin.0);
+    actions.push(("project.moveToBin".into(), json!({"items": [dragged], "bin": bin})));
+    crate::panels::clear_drag(ui);
 }
 
 /// The inline rename field at `r`; true while it is shown.
@@ -422,6 +497,7 @@ pub fn list_view(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, v: &View
     let root = app.session.project.root.find_bin(v.bin).cloned().unwrap_or_default();
     let out = egui::ScrollArea::both().id_salt((&v.prefix, "list-scroll")).auto_shrink([false, false]).show(&mut bui, |ui| {
         ui.set_min_width(lc.width);
+        let bg = background(ui, v);
         let mut row = 0usize;
         list_bin(app, ui, &root, 0, filter, &mut row, actions, v, &lc);
         if v.inst == Inst::Main && v.bin == app.session.project.root.id {
@@ -430,7 +506,7 @@ pub fn list_view(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, v: &View
             };
             crate::panels::menu_dialogs::search_bin_rows(app, ui, &mut row, actions, &mut draw);
         }
-        empty_space(app, ui, v, actions);
+        empty_space(app, ui, v, &bg, actions);
     });
     // pinned header, scrolled horizontally with the rows
     let hr = Rect::from_min_size(rect.min, vec2(rect.width(), header_h));
@@ -450,10 +526,13 @@ pub fn list_view(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, v: &View
                 hp.rect_filled(cr, 0.0, t.hover);
             }
             let g = hp.layout_no_wrap(crate::i18n::t(&c.name).to_string(), Tokens::ui(f - 0.5), t.text_dim);
-            let gw = g.size().x;
-            hp.with_clip_rect(cr.shrink2(vec2(4.0, 0.0)).intersect(hr)).galley(pos2(cr.min.x + 6.0, cr.center().y - g.size().y / 2.0), g, t.text_dim);
+            // The sort arrow sits in the right of the header. Leave it a gap so it does not cover the name (#1295).
+            let arrow = if sort.column == c.name { 14.0 } else { 0.0 };
+            let label = cr.shrink2(vec2(4.0, 0.0));
+            let label = egui::Rect::from_min_max(label.min, pos2((label.max.x - arrow).max(label.min.x), label.max.y)).intersect(hr);
+            hp.with_clip_rect(label).galley(pos2(cr.min.x + 6.0, cr.center().y - g.size().y / 2.0), g, t.text_dim);
             if sort.column == c.name {
-                let ax = (cr.min.x + 10.0 + gw).min(cr.max.x - 8.0);
+                let ax = cr.max.x - 8.0;
                 let (a, b) = if sort.descending { (cr.center().y + 4.0, cr.center().y - 4.0) } else { (cr.center().y - 4.0, cr.center().y + 4.0) };
                 hp.line_segment([pos2(ax, b), pos2(ax, a)], Stroke::new(1.3, t.text_dim));
                 hp.line_segment([pos2(ax - 3.0, a + (b - a).signum() * 3.0), pos2(ax, a)], Stroke::new(1.3, t.text_dim));
@@ -491,21 +570,89 @@ pub fn list_view(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, v: &View
     }
 }
 
-/// Empty space under the rows / cards: click deselects, double-click imports, right-click menu.
-fn empty_space(app: &mut FilmcraftApp, ui: &mut egui::Ui, v: &View, actions: &mut Actions) {
+/// The List / Icon view background, under the rows and cards (call it before drawing them, so they
+/// sit on top). Starts the frame's [`note_hit`] list.
+fn background(ui: &egui::Ui, v: &View) -> egui::Response {
+    ui.data_mut(|d| d.remove::<Vec<(u64, Rect)>>(hits_id(v)));
+    ui.interact(ui.clip_rect(), egui::Id::new((&v.prefix, "background")), Sense::click_and_drag())
+}
+
+/// Empty space under the rows / cards, and the gaps between them (`bg`): click deselects,
+/// double-click imports, right-click menu, drag selects with a marquee.
+fn empty_space(app: &mut FilmcraftApp, ui: &mut egui::Ui, v: &View, bg: &egui::Response, actions: &mut Actions) {
     let rest = ui.available_rect_before_wrap();
     let r = Rect::from_min_size(rest.min, vec2(rest.width(), rest.height().max(40.0)));
-    let resp = ui.allocate_rect(r, Sense::click());
+    ui.allocate_rect(r, Sense::hover());
     app.auto.add(&format!("{}.empty", v.prefix), r.intersect(ui.clip_rect()), "Empty area");
-    if resp.clicked() {
+    marquee(app, ui, v, bg, ui.max_rect().min, actions);
+    accept_view_drop(app, ui, r, v, actions);
+    if bg.clicked() {
         app.ui.project_panel.selected_bin = None;
         actions.push(("project.select".into(), json!({"items": []})));
     }
-    if resp.double_clicked() {
+    if bg.double_clicked() {
         actions.push(("file.import".into(), json!({})));
     }
     let bin = (v.bin != app.session.project.root.id).then_some(v.bin.0);
-    resp.context_menu(|ui| background_menu(app, ui, v, bin, actions));
+    bg.context_menu(|ui| background_menu(app, ui, v, bin, actions));
+}
+
+fn hits_id(v: &View) -> egui::Id {
+    egui::Id::new((&v.prefix, "marquee-hits"))
+}
+
+/// Remember where an item's row or card was drawn this frame, for [`marquee`].
+fn note_hit(ui: &egui::Ui, v: &View, id: ItemId, r: Rect) {
+    ui.data_mut(|d| d.get_temp_mut_or_default::<Vec<(u64, Rect)>>(hits_id(v)).push((id.0, r)));
+}
+
+/// Marquee selection: dragging `bg` (empty space) selects every item drawn this frame whose rect
+/// the rectangle touches, live. Shift/Ctrl add to the selection the drag started with; Escape
+/// cancels and restores it. `origin` is the content's top-left, so scrolling keeps the anchor.
+fn marquee(app: &mut FilmcraftApp, ui: &egui::Ui, v: &View, bg: &egui::Response, origin: egui::Pos2, actions: &mut Actions) {
+    // (press point relative to `origin`, selection when the drag began, adds to it)
+    type Drag = (egui::Vec2, Vec<u64>, bool);
+    let key = egui::Id::new((&v.prefix, "marquee"));
+    let hits: Vec<(u64, Rect)> = ui.data_mut(|d| d.remove_temp(hits_id(v))).unwrap_or_default();
+    let current: Vec<u64> = app.session.state.project_selection.iter().map(|i| i.0).collect();
+    // the left button only: right-click opens the menu, the middle button is not a selection
+    let primary = egui::PointerButton::Primary;
+    if bg.drag_started_by(primary) {
+        let press = ui.input(|i| i.pointer.press_origin()).unwrap_or(origin);
+        let m = ui.input(|i| i.modifiers);
+        let add = m.shift || m.command;
+        if !add {
+            app.ui.project_panel.selected_bin = None;
+        }
+        ui.data_mut(|d| d.insert_temp::<Drag>(key, (press - origin, current.clone(), add)));
+    }
+    let Some((anchor, before, add)) = ui.data(|d| d.get_temp::<Drag>(key)) else { return };
+    let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    if cancel || !(bg.dragged_by(primary) || bg.drag_stopped_by(primary)) {
+        ui.data_mut(|d| d.remove::<Drag>(key));
+        if cancel && before != current {
+            actions.push(("project.select".into(), json!({"items": before})));
+        }
+        return;
+    }
+    let Some(now) = ui.ctx().pointer_latest_pos() else { return };
+    let r = Rect::from_two_pos(origin + anchor, now);
+    let mut sel = if add { before } else { Vec::new() };
+    for (id, hr) in &hits {
+        if hr.intersects(r) && !sel.contains(id) {
+            sel.push(*id);
+        }
+    }
+    if sel != current {
+        actions.push(("project.select".into(), json!({"items": sel})));
+    }
+    let t = app.tokens;
+    ui.painter().rect_filled(r, 0.0, t.accent.gamma_multiply(0.18));
+    ui.painter().rect_stroke(r, 0.0, Stroke::new(1.0, t.accent), StrokeKind::Inside);
+    app.auto.add(&format!("{}.marquee", v.prefix), r, "Marquee");
+    if bg.drag_stopped_by(primary) {
+        ui.data_mut(|d| d.remove::<Drag>(key));
+    }
 }
 
 fn background_menu(app: &mut FilmcraftApp, ui: &mut egui::Ui, v: &View, bin: Option<u64>, actions: &mut Actions) {
@@ -517,7 +664,7 @@ fn background_menu(app: &mut FilmcraftApp, ui: &mut egui::Ui, v: &View, bin: Opt
         (tl!("Import…"), "file.import"),
     ] {
         if ui.button(label).clicked() {
-            let p = if cmd == "file.newBin" { json!({"name": tl!("New Bin"), "parent": bin}) } else { json!({}) };
+            let p = if cmd == "file.newBin" { json!({"parent": bin, "panel": v.prefix}) } else { json!({}) };
             actions.push((cmd.into(), p));
             ui.close();
         }
@@ -532,7 +679,7 @@ fn list_bin(app: &mut FilmcraftApp, ui: &mut egui::Ui, bin: &Bin, depth: usize, 
     for bid in bins {
         let Some(b) = app.session.project.root.find_bin(bid).cloned() else { continue };
         let open = app.ui.expanded_bins.contains(&b.id.0) || !filter.is_empty();
-        let (r, resp) = ui.allocate_exact_size(vec2(lc.width, lc.row_h), Sense::click());
+        let (r, resp) = ui.allocate_exact_size(vec2(lc.width, lc.row_h), Sense::click_and_drag());
         let selected = app.ui.project_panel.selected_bin == Some(b.id.0);
         if selected {
             ui.painter().rect_filled(r, 0.0, t.row_selected);
@@ -551,6 +698,9 @@ fn list_bin(app: &mut FilmcraftApp, ui: &mut egui::Ui, bin: &Bin, depth: usize, 
         app.auto.add(&format!("{}.bin.{}", v.prefix, b.id.0), r.intersect(ui.clip_rect()), &b.name);
         app.auto.add(&format!("{}.bin.{}.toggle", v.prefix, b.id.0), tri, "Expand");
         accept_bin_drop(app, ui, r, b.id.0, actions);
+        if resp.drag_started() {
+            crate::panels::start_drag_bin(ui, b.id.0);
+        }
         if resp.clicked() {
             let on_tri = resp.interact_pointer_pos().is_some_and(|p| p.x < x + 12.0);
             if on_tri || app.ui.project_panel.selected_bin == Some(b.id.0) && !resp.double_clicked() {
@@ -580,6 +730,7 @@ fn list_bin(app: &mut FilmcraftApp, ui: &mut egui::Ui, bin: &Bin, depth: usize, 
         }
         let Some(it) = app.session.project.item(id).cloned() else { continue };
         let (r, resp) = ui.allocate_exact_size(vec2(lc.width, lc.row_h), Sense::click_and_drag());
+        note_hit(ui, v, id, r);
         let selected = app.session.state.project_selection.contains(&id);
         if selected {
             ui.painter().rect_filled(r, 0.0, t.row_selected);
@@ -631,7 +782,7 @@ fn list_bin(app: &mut FilmcraftApp, ui: &mut egui::Ui, bin: &Bin, depth: usize, 
         }
         app.auto.add(&format!("{}.item.{}", v.prefix, id.0), r.intersect(ui.clip_rect()), &it.name);
         slow_click_rename(app, ui, &resp, name_r, id, selected);
-        item_interactions(app, ui, &resp, id, &it.kind, actions, true, true);
+        item_interactions(app, ui, v, &resp, id, &it.kind, actions, true, true);
     }
 }
 
@@ -761,7 +912,7 @@ fn card(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, id: ItemId, pre: &st
 fn bin_card(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, b: &Bin, v: &View, actions: &mut Actions) {
     let t = app.tokens;
     let th = Rect::from_min_size(r.min, vec2(r.width(), r.width() * 9.0 / 16.0));
-    let resp = ui.interact(r.expand(2.0), egui::Id::new((&v.prefix, "bincard", b.id.0)), Sense::click());
+    let resp = ui.interact(r.expand(2.0), egui::Id::new((&v.prefix, "bincard", b.id.0)), Sense::click_and_drag());
     let selected = app.ui.project_panel.selected_bin == Some(b.id.0);
     let bg = Rect::from_min_max(th.min - vec2(6.0, 6.0), pos2(th.max.x + 6.0, r.max.y + 2.0));
     ui.painter().rect_filled(bg, 4.0, if selected { t.tl_header_bg } else { t.panel_bg });
@@ -780,6 +931,9 @@ fn bin_card(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, b: &Bin, v: &Vie
     }
     app.auto.add(&format!("{}.bin.{}", v.prefix, b.id.0), th, &b.name);
     accept_bin_drop(app, ui, th, b.id.0, actions);
+    if resp.drag_started() {
+        crate::panels::start_drag_bin(ui, b.id.0);
+    }
     if resp.clicked() {
         app.ui.project_panel.selected_bin = Some(b.id.0);
         actions.push(("project.select".into(), json!({"items": []})));
@@ -806,6 +960,7 @@ pub fn icon_view(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, v: &View
     };
     let n = bins.len() + ids.len();
     egui::ScrollArea::vertical().id_salt((&v.prefix, "icon-scroll")).auto_shrink([false, false]).show(ui, |ui| {
+        let bg = background(ui, v);
         let per_row = ((rect.width() - 12.0) / cell.x).floor().max(1.0) as usize;
         if v.inst == Inst::Main {
             app.ui.keys.icon_columns = per_row;
@@ -827,13 +982,14 @@ pub fn icon_view(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, v: &View
                 let Some(kind) = app.session.project.item(id).map(|x| x.kind.clone()) else { continue };
                 let was_selected = app.session.state.project_selection.contains(&id);
                 if let Some(resp) = card(app, ui, r, id, &v.prefix, true, true, Sense::click_and_drag()) {
+                    note_hit(ui, v, id, r);
                     let name_r = Rect::from_min_max(pos2(r.min.x, r.min.y + th_h), r.max);
                     slow_click_rename(app, ui, &resp, name_r, id, was_selected);
-                    item_interactions(app, ui, &resp, id, &kind, actions, true, true);
+                    item_interactions(app, ui, v, &resp, id, &kind, actions, true, true);
                 }
             }
         }
-        empty_space(app, ui, v, actions);
+        empty_space(app, ui, v, &bg, actions);
     });
 }
 
@@ -856,7 +1012,8 @@ pub fn freeform_view(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, v: &
     };
     let extent = cards.iter().fold(vec2(rect.width(), rect.height()), |e, c| vec2(e.x.max(c.x + c.size + 40.0), e.y.max(c.y + c.size * 9.0 / 16.0 + 60.0)));
     egui::ScrollArea::both().id_salt((&v.prefix, "ff-scroll")).auto_shrink([false, false]).show(ui, |ui| {
-        let (canvas, bg) = ui.allocate_exact_size(extent, Sense::click());
+        ui.data_mut(|d| d.remove::<Vec<(u64, Rect)>>(hits_id(v)));
+        let (canvas, bg) = ui.allocate_exact_size(extent, Sense::click_and_drag());
         app.auto.add(&format!("{}.freeform", v.prefix), canvas, "Freeform canvas");
         if opts.snap {
             let g = opts.grid.max(4.0);
@@ -888,6 +1045,7 @@ pub fn freeform_view(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, v: &
             let r = Rect::from_min_size(canvas.min + vec2(c.x, c.y) + off, vec2(c.size, c.size * 9.0 / 16.0 + 20.0));
             let Some(kind) = app.session.project.item(ItemId(c.item)).map(|x| x.kind.clone()) else { continue };
             let Some(resp) = card(app, ui, r, ItemId(c.item), &v.prefix, opts.show_names, opts.show_durations, Sense::click_and_drag()) else { continue };
+            note_hit(ui, v, ItemId(c.item), r);
             if let Some(s) = c.stack
                 && s == c.item
                 && let Some(n) = stack_n.get(&s)
@@ -897,8 +1055,14 @@ pub fn freeform_view(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, v: &
                 ui.painter().text(br.center(), Align2::CENTER_CENTER, format!("×{n}"), Tokens::ui(10.0), Color32::WHITE);
                 app.auto.add(&format!("{}.stack.{s}", v.prefix), br, &format!("Stack of {n}"));
             }
-            item_interactions(app, ui, &resp, ItemId(c.item), &kind, actions, false, false);
-            if resp.dragged() {
+            item_interactions(app, ui, v, &resp, ItemId(c.item), &kind, actions, false, false);
+            // Escape puts the cards back and drops nothing until the button comes up (#580); egui
+            // also ends the drag on Escape, so it arrives as a stop as often as during the drag
+            let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            if (resp.dragged() || resp.drag_stopped()) && (escape || crate::panels::drag_cancelled(ui)) {
+                ui.ctx().data_mut(|d| d.remove::<(u64, egui::Vec2)>(drag_key));
+                crate::panels::cancel_drag(ui);
+            } else if resp.dragged() {
                 let total = dragging.filter(|d| d.0 == c.item).map(|d| d.1).unwrap_or_default() + resp.drag_delta();
                 ui.ctx().data_mut(|d| d.insert_temp(drag_key, (c.item, total)));
                 // leaving the panel turns the move into an item drag (to the Timeline, a monitor)
@@ -909,11 +1073,12 @@ pub fn freeform_view(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, v: &
                     crate::panels::start_drag_item(ui, ItemId(c.item));
                 }
             }
-            if resp.drag_stopped() {
+            if resp.drag_stopped() && !crate::panels::drag_cancelled(ui) {
                 released = dragging.filter(|d| d.0 == c.item).map(|d| (d.0, d.1 + resp.drag_delta()));
             }
             resp.context_menu(|ui| card_menu(app, ui, v, c.item, actions));
         }
+        marquee(app, ui, v, &bg, canvas.min, actions);
         if let Some((item, off)) = released {
             ui.ctx().data_mut(|d| d.remove::<(u64, egui::Vec2)>(drag_key));
             let inside = ui.ctx().pointer_latest_pos().is_some_and(|p| rect.contains(p));
@@ -1032,4 +1197,45 @@ fn canvas_menu(app: &mut FilmcraftApp, ui: &mut egui::Ui, v: &View, bin: Option<
     entry(app, ui, v, actions, "options", "Freeform View Options…", "projectPanel.freeformOptions", json!({}));
     ui.separator();
     background_menu(app, ui, v, bin.filter(|b| *b != app.session.project.root.id.0), actions);
+}
+
+#[cfg(test)]
+mod clear_tests {
+    use super::{clear_params, click_selection};
+    use filmcraft_project::ItemId;
+    use serde_json::json;
+
+    #[test]
+    fn clear_falls_back_to_the_selected_bin() {
+        assert_eq!(clear_params(&[], Some(7)), Some(json!({"items": [7]})));
+        assert_eq!(clear_params(&[ItemId(3)], Some(7)), Some(json!({})));
+        assert_eq!(clear_params(&[], None), None);
+    }
+
+    fn ids(v: &[u64]) -> Vec<ItemId> {
+        v.iter().map(|i| ItemId(*i)).collect()
+    }
+
+    #[test]
+    fn shift_click_selects_the_range_from_the_anchor() {
+        let order = ids(&[1, 2, 3, 4, 5]);
+        let sel = click_selection(&ids(&[2]), &order, Some(ItemId(2)), ItemId(4), true, false);
+        assert_eq!(sel, ids(&[2, 3, 4]));
+        // backwards, and replacing a different selection
+        let sel = click_selection(&ids(&[5]), &order, Some(ItemId(4)), ItemId(2), true, false);
+        assert_eq!(sel, ids(&[2, 3, 4]));
+        // Ctrl/Cmd+Shift extends the selection
+        let sel = click_selection(&ids(&[1]), &order, Some(ItemId(3)), ItemId(4), true, true);
+        assert_eq!(sel, ids(&[1, 3, 4]));
+        // no anchor in the shown items: like a plain click
+        assert_eq!(click_selection(&ids(&[1]), &order, Some(ItemId(9)), ItemId(4), true, false), ids(&[4]));
+    }
+
+    #[test]
+    fn command_click_toggles_and_plain_click_replaces() {
+        let order = ids(&[1, 2, 3]);
+        assert_eq!(click_selection(&ids(&[1]), &order, None, ItemId(3), false, true), ids(&[1, 3]));
+        assert_eq!(click_selection(&ids(&[1, 3]), &order, None, ItemId(3), false, true), ids(&[1]));
+        assert_eq!(click_selection(&ids(&[1, 3]), &order, None, ItemId(2), false, false), ids(&[2]));
+    }
 }

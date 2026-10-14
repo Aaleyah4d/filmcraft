@@ -38,10 +38,13 @@ use filmcraft_frame::{Chroma, PixelData, VideoFrame};
 use filmcraft_render::Blend;
 use filmcraft_render::plan::{FramePlan, PlanLayer, PlanStep};
 
+pub mod adapter;
+pub mod export_renderer;
 pub mod fx;
 pub mod lut;
 pub mod mask;
 mod transition;
+pub use export_renderer::ExportRenderer;
 pub use lut::GpuLut;
 pub use mask::GpuMask;
 
@@ -78,6 +81,7 @@ pub struct GpuCompositor {
     /// Copy of the accumulator under a blend-mode layer (allocated on first use).
     backdrop: Option<(wgpu::Texture, wgpu::TextureView, (u32, u32))>,
     output: Option<(wgpu::Texture, wgpu::TextureView, (u32, u32))>,
+    accum_readback_buf: Option<(wgpu::Buffer, u64)>,
     uploads: HashMap<(usize, u32, u32), Uploaded>,
     clock: u64,
     dummy: wgpu::TextureView,
@@ -133,6 +137,46 @@ pub fn f32_to_f16(v: f32) -> u16 {
         h += 1;
     }
     h as u16
+}
+
+/// IEEE half → f32 (the inverse of [`f32_to_f16`]), for reading `Rgba16Float` textures back.
+pub fn f16_to_f32(h: u16) -> f32 {
+    let sign = ((h & 0x8000) as u32) << 16;
+    let exp = ((h >> 10) & 0x1f) as u32;
+    let mant = (h & 0x03ff) as u32;
+    let bits = match exp {
+        0 => {
+            if mant == 0 {
+                sign
+            } else {
+                // Half subnormal: value = mant × 2⁻²⁴ = (1 + frac) × 2^(b−24) with b the mantissa's
+                // highest set bit — renormalise into an f32.
+                let b = 31 - mant.leading_zeros();
+                let frac = (mant ^ (1 << b)) << (23 - b);
+                sign | ((103 + b) << 23) | frac
+            }
+        }
+        0x1f => sign | 0x7f80_0000 | (mant << 13),
+        _ => sign | ((exp + 112) << 23) | (mant << 13),
+    };
+    f32::from_bits(bits)
+}
+
+/// [`f16_to_f32`] with a branch-light path for normal numbers and zeros (the bulk of read-back
+/// data); subnormals, infinities and NaNs take the general path. Same result for every input.
+#[inline(always)]
+pub fn f16_to_f32_fast(h: u16) -> f32 {
+    let u = u32::from(h);
+    let sign = (u & 0x8000) << 16;
+    let abs = u & 0x7fff;
+    if (0x0400..0x7c00).contains(&abs) {
+        // rebias the exponent (127 - 15 = 112) and widen the mantissa
+        f32::from_bits(sign | ((abs + (112 << 10)) << 13))
+    } else if abs == 0 {
+        f32::from_bits(sign)
+    } else {
+        f16_to_f32(h)
+    }
 }
 
 /// Half-float texel data for one frame (one byte vector per plane), converted off the UI thread.
@@ -344,7 +388,23 @@ impl GpuCompositor {
             view_formats: &[],
         });
         let dummy = dummy_tex.create_view(&Default::default());
-        let fx = fx::FxStage::supported(device).then(|| fx::FxStage::new(device, &shader, &layer_bgl));
+        // The effect stage's pipelines can still be invalid on a device that passes the limits
+        // check (Rgba32Float is not renderable everywhere, e.g. software Vulkan/GL). Validation
+        // errors would panic, so they are captured: without the stage, effects render on the CPU.
+        let fx = fx::FxStage::supported(device)
+            .then(|| {
+                let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let stage = fx::FxStage::new(device, &shader, &layer_bgl);
+                match poll_now(scope.pop()) {
+                    Some(None) => Some(stage),
+                    Some(Some(e)) => {
+                        log::warn!("GPU effects unavailable on this device, rendering them on the CPU: {e}");
+                        None
+                    }
+                    None => None,
+                }
+            })
+            .flatten();
         Self {
             device: device.clone(),
             queue: queue.clone(),
@@ -357,6 +417,7 @@ impl GpuCompositor {
             accum: None,
             backdrop: None,
             output: None,
+            accum_readback_buf: None,
             uploads: HashMap::new(),
             clock: 0,
             dummy,
@@ -542,10 +603,11 @@ impl GpuCompositor {
             chroma: up.chroma,
             size: (f.width, f.height),
             color: f.color,
+            input: None,
         })
     }
 
-    fn uniforms(src: &SrcInfo, m: &filmcraft_geom::Affine, opacity: f32, blend: Blend, out: (u32, u32)) -> [f32; 28] {
+    fn uniforms(src: &SrcInfo, m: &filmcraft_geom::Affine, opacity: f32, blend: Blend, out: (u32, u32)) -> [f32; UNIFORM_FLOATS] {
         let (kr, kb) = src.color.matrix.kr_kb();
         let bits_scale = src.code_levels / 256.0; // 2^(bits - 8), independent of texture encoding
         let (yo, ys, co, cs) = match (src.color.range, src.kind) {
@@ -565,7 +627,31 @@ impl GpuCompositor {
         let footprint = (1.0 / sx.min(sy).max(1e-6)) as f32;
         let taps = if footprint > 1.25 { footprint.ceil().min(4.0) } else { 1.0 };
         let _ = Matrix::Bt709;
-        [
+        // colour management (q0..q5), stage by stage as `InputTransform::apply`
+        let q = src.input.map_or([0.0; 24], |p| {
+            let curve = match p.curve {
+                filmcraft_color::GpuCurve::Sdr => 0.0,
+                filmcraft_color::GpuCurve::Linear => 1.0,
+                filmcraft_color::GpuCurve::Pq => 2.0,
+                filmcraft_color::GpuCurve::Hlg => 3.0,
+            };
+            let (hl, hk) = p.hlg.unwrap_or(([0.0; 3], 0.0));
+            let mx = p.matrix.unwrap_or([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+            let (sp, dp) = p.tone.unwrap_or((0.0, 0.0));
+            let dl = p.desaturate.unwrap_or([0.0; 3]);
+            let on = |b: bool| if b { 1.0 } else { 0.0 };
+            #[rustfmt::skip]
+            let q = [
+                1.0, curve, hk, filmcraft_color::REFERENCE_WHITE_NITS as f32,
+                hl[0], hl[1], hl[2], on(p.matrix.is_some()),
+                mx[0][0], mx[0][1], mx[0][2], on(p.tone.is_some()),
+                mx[1][0], mx[1][1], mx[1][2], sp,
+                mx[2][0], mx[2][1], mx[2][2], dp,
+                dl[0], dl[1], dl[2], on(p.desaturate.is_some()),
+            ];
+            q
+        });
+        let base = [
             m.a as f32,
             m.b as f32,
             m.c as f32,
@@ -594,10 +680,14 @@ impl GpuCompositor {
             src.alpha,
             0.0,
             0.0,
-        ]
+        ];
+        let mut u = [0.0; UNIFORM_FLOATS];
+        u[..28].copy_from_slice(&base);
+        u[28..].copy_from_slice(&q);
+        u
     }
 
-    fn uniform_buffer(&self, u: &[f32; 28]) -> wgpu::Buffer {
+    fn uniform_buffer(&self, u: &[f32; UNIFORM_FLOATS]) -> wgpu::Buffer {
         let bytes: Vec<u8> = u.iter().flat_map(|v| v.to_le_bytes()).collect();
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("layer-u"),
@@ -635,7 +725,8 @@ impl GpuCompositor {
                     },
                     None => VideoFrame::rgba_f32(img.w as u32, img.h as u32, img.px.clone()),
                 };
-                owned = [PlanLayer { frame: Arc::new(frame), matrix: filmcraft_geom::Affine::IDENTITY, opacity: 1.0, blend: Blend::Normal, fx: None }];
+                owned =
+                    [PlanLayer { frame: Arc::new(frame), matrix: filmcraft_geom::Affine::IDENTITY, opacity: 1.0, blend: Blend::Normal, fx: None, input: None }];
                 (img.w as u32, img.h as u32, &owned[..])
             }
             FramePlan::Composite { width, height, steps } => return self.composite_steps(*width, *height, steps, prep),
@@ -692,7 +783,10 @@ impl GpuCompositor {
                 chroma: (1, 1),
                 size: (l.frame.width, l.frame.height),
                 color: l.frame.color,
+                input: None,
             });
+            // HDR / wide-gamut Y'CbCr: the planner's input transform, in the shader (#965)
+            let src = SrcInfo { input: l.input.as_ref().filter(|_| src.kind == 2).and_then(|t| t.gpu_params()), ..src };
             let views = self.uploads.get(k).map_or_else(|| std::array::from_fn(|_| self.dummy.clone()), |up| up.views.clone());
             let job = match &l.fx {
                 Some(lfx) => {
@@ -724,7 +818,8 @@ impl GpuCompositor {
             // what the layer draws: the effect result (linear premultiplied RGBA) or the frame
             let (u, tex) = match &job {
                 Some(j) => {
-                    let s = SrcInfo { kind: 1, code_scale: 1.0, code_levels: 1.0, alpha: 0.0, chroma: l.size(), size: l.size(), color: l.frame.color };
+                    let s =
+                        SrcInfo { kind: 1, code_scale: 1.0, code_levels: 1.0, alpha: 0.0, chroma: l.size(), size: l.size(), color: l.frame.color, input: None };
                     (Self::uniforms(&s, &l.matrix, l.opacity, l.blend, (w, h)), [j.result.clone(), self.dummy.clone(), self.dummy.clone(), self.dummy.clone()])
                 }
                 None => {
@@ -869,6 +964,22 @@ impl GpuCompositor {
         self.render_plan(&empty, None, false, true)
     }
 
+    /// Export rendering: `plan` composited into the linear float accumulator and read back as
+    /// premultiplied RGBA f32 (the sRGB resolve is skipped). None for a plan the export path does
+    /// not run on the GPU (transitions: the caller renders those on the CPU) or a failed read-back.
+    pub fn render_export_prepared(&mut self, plan: &FramePlan, prep: Option<&PreparedPlan>) -> Option<(u32, u32, Vec<f32>)> {
+        if matches!(plan, FramePlan::Composite { .. }) {
+            return None;
+        }
+        let t = std::time::Instant::now();
+        self.render_plan(plan, prep, true, false);
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("filmcraft-composite-export") });
+        let size = self.copy_accumulator(&mut enc)?;
+        self.queue.submit([enc.finish()]);
+        export_renderer::timing::add_submit(t.elapsed());
+        self.map_accumulator(size)
+    }
+
     /// Run the effect stage of a layer alone: `frame` decoded into its working image and `fx`
     /// applied, read back as linear premultiplied RGBA f32 (what `LayerFx` ops produce on the
     /// CPU from the same frame). None when the working image does not fit in a texture.
@@ -917,7 +1028,7 @@ impl GpuCompositor {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        wait_mapped(&self.device)?;
         rx.recv().ok()?.ok()?;
         let data = slice.get_mapped_range().ok()?;
         let mut out = Vec::with_capacity((w * h * 4) as usize);
@@ -928,6 +1039,77 @@ impl GpuCompositor {
         drop(data);
         buf.unmap();
         Some((w, h, out))
+    }
+
+    /// Read the **linear float accumulator** back as premultiplied RGBA f32 (export rendering):
+    /// the display texture this crate's [`read_output`](Self::read_output) resolves is sRGB 8-bit
+    /// and would clip the working-space data HDR exports need. The accumulator must have been
+    /// composited first ([`composite`](Self::composite) / [`composite_prepared`](Self::composite_prepared)).
+    pub fn read_accumulator(&mut self) -> Option<(u32, u32, Vec<f32>)> {
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        let size = self.copy_accumulator(&mut enc)?;
+        self.queue.submit([enc.finish()]);
+        self.map_accumulator(size)
+    }
+
+    /// Record a copy of the accumulator into the staging buffer (grown when too small, reused
+    /// otherwise); returns its width, height and row pitch in bytes.
+    fn copy_accumulator(&mut self, enc: &mut wgpu::CommandEncoder) -> Option<(u32, u32, u32)> {
+        let (_, _, (w, h)) = self.accum.as_ref()?;
+        let (w, h) = (*w, *h);
+        let row = w.checked_mul(8)?.div_ceil(256).checked_mul(256)?;
+        let needed = u64::from(row) * u64::from(h);
+        if self.accum_readback_buf.as_ref().is_none_or(|(_, size)| *size < needed) {
+            let b = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("accum-readback"),
+                size: needed,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            self.accum_readback_buf = Some((b, needed));
+        }
+        let (tex, _, _) = self.accum.as_ref()?;
+        let (buf, _) = self.accum_readback_buf.as_ref()?;
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) } },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        Some((w, h, row))
+    }
+
+    /// Wait for the staging buffer filled by [`copy_accumulator`](Self::copy_accumulator) and
+    /// convert its half floats to f32.
+    fn map_accumulator(&self, (w, h, row): (u32, u32, u32)) -> Option<(u32, u32, Vec<f32>)> {
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let t = std::time::Instant::now();
+        let (buf, _) = self.accum_readback_buf.as_ref()?;
+        let slice = buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        wait_mapped(&self.device)?;
+        rx.recv().ok()?.ok()?;
+        export_renderer::timing::add_map_wait(t.elapsed());
+        let t = std::time::Instant::now();
+        let (width, row) = (w as usize, row as usize);
+        let mut out = filmcraft_frame::pool::take_f32_overwritten(width.checked_mul(h as usize)?.checked_mul(4)?);
+        let data = slice.get_mapped_range().ok()?;
+        // every row must be there: the pooled output holds stale values until written
+        let converted = out.chunks_exact_mut(width * 4).enumerate().all(|(y, dst)| {
+            let Some(src) = data.get(y * row..y * row + width * 8) else { return false };
+            for (d, s) in dst.iter_mut().zip(src.as_chunks::<2>().0) {
+                *d = f16_to_f32_fast(u16::from_le_bytes(*s));
+            }
+            true
+        });
+        drop(data);
+        buf.unmap();
+        export_renderer::timing::add_convert(t.elapsed());
+        converted.then_some((w, h, out))
     }
 
     /// Read the output back as RGBA8 (tests / screenshots / thumbnails).
@@ -952,7 +1134,7 @@ impl GpuCompositor {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        wait_mapped(&self.device)?;
         rx.recv().ok()?.ok()?;
         let data = slice.get_mapped_range().ok()?;
         let mut out = Vec::with_capacity((w * h * 4) as usize);
@@ -963,6 +1145,15 @@ impl GpuCompositor {
         buf.unmap();
         Some((*w, *h, out))
     }
+}
+
+/// Wait for the last submission and its `map_async` callbacks.
+///
+/// Export readback used `PollType::wait_indefinitely`. On radv that can never return after a
+/// failed hardware-encode attempt (#1058), so the export never finishes. Eight seconds is longer
+/// than a healthy map; a timeout returns `None` and the CPU renderer takes the frame.
+fn wait_mapped(device: &wgpu::Device) -> Option<()> {
+    device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(8)) }).ok().map(|_| ())
 }
 
 /// Shader source: kind (0 RGBA8 sRGB, 1 linear premultiplied RGBA, 2 YUV), sampling scales, dimensions, color.
@@ -977,6 +1168,21 @@ struct SrcInfo {
     chroma: (u32, u32),
     size: (u32, u32),
     color: filmcraft_color::ColorInfo,
+    /// Colour management beyond the default decode (a Y'CbCr layer's [`PlanLayer::input`]).
+    input: Option<filmcraft_color::GpuInputParams>,
+}
+
+/// Floats in a layer's uniform block (`U` in `composite.wgsl`: 13 vec4).
+const UNIFORM_FLOATS: usize = 52;
+
+/// Poll a future once: wgpu's native error scopes resolve immediately. `None` if it is still
+/// pending (then the caller assumes the worst).
+fn poll_now<F: std::future::Future>(f: F) -> Option<F::Output> {
+    let mut f = std::pin::pin!(f);
+    match f.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())) {
+        std::task::Poll::Ready(v) => Some(v),
+        std::task::Poll::Pending => None,
+    }
 }
 
 /// A render pass drawing into the accumulator.

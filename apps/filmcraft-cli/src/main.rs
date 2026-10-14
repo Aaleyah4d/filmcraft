@@ -56,7 +56,7 @@ fn stdout_failed(e: std::io::Error) {
     if STDOUT_GONE.swap(true, Ordering::Relaxed) || e.kind() == std::io::ErrorKind::BrokenPipe {
         return;
     }
-    eprintln!("filmcraft-cli: can't write to stdout: {e}");
+    diag(format_args!("filmcraft-cli: can't write to stdout: {e}"));
     STDOUT_ERROR.store(true, Ordering::Relaxed);
 }
 
@@ -75,18 +75,22 @@ SUBCOMMANDS
   inspect [project|sequence]    project tree or active sequence as JSON (default: both)
   import <file>...              import media into the project
   export <out> [--preset name] [--format f] [--range r] [--start s --end s] [--settings json]
-         [--scale f] [--quality 0-100] [--no-audio] [--queue]
+         [--gpu-rendering auto|off]
+         [--scale f] [--quality 0-100] [--no-audio] [--queue] [--allow-offline]
                                 export the active sequence and wait for it to finish: with an
                                 export preset (`export --list-presets`; built-in or the user's), or
-                                a format (h264|hevc|prores|dnxhr|apv|mjpeg|mxf-op1a|mxf-opatom|png|tiff|bmp|gif|wav|aiff, guessed
+                                a format (h264|hevc|prores|dnxhr|apv|mjpeg|mxf-op1a|mxf-opatom|png|tiff|bmp|gif|wav|aiff|aac, guessed
                                 from the extension); --range entire|inOut|workArea, or a custom
                                 range in seconds; --settings is ExportSettings JSON merged over the
                                 preset; --scale renders at a fraction of the frame size (0.5 =
                                 half); --quality 0-100 for the formats that take one; --no-audio
                                 leaves the sound out; --queue adds to the export queue and runs it
-                                instead
+                                instead. Offline media (missing, made offline, unreadable) renders
+                                as placeholder frames: the export then lists it in `offlineMedia`,
+                                warns on stderr and exits 1, unless --allow-offline accepts it
   export --list-presets [query] list export presets (name, category, format) as JSON
-  render --seconds S --out f.png [--scale 0.5]   render one Program frame to PNG
+  render --seconds S --out f.png [--scale 0.5] [--allow-offline]
+                                render one Program frame to PNG (offline media: as for export)
   probe <media> [--image-sequence]
                                 media info as JSON, with MXF / Ogg / BWF details; with
                                 --image-sequence <media> is the first numbered still of a sequence
@@ -112,16 +116,27 @@ VALUES
   Times: 254016000000 ticks per second; most commands also take seconds=, frame= or timecode=.
 
 EXIT STATUS
-  0 success · 1 a command failed · 2 usage error
+  0 success · 1 a command failed, or export/render drew offline media without --allow-offline
+  · 2 usage error
 ";
 
+/// Writes one diagnostic line to `w`, dropping any write error. `eprintln!` panics (exit 101) when stderr's
+/// reader is gone, which would turn a usage error, a failure or a finished export into a crash.
+fn write_diag(w: &mut dyn std::io::Write, msg: std::fmt::Arguments) {
+    let _ = writeln!(w, "{msg}");
+}
+
+fn diag(msg: std::fmt::Arguments) {
+    write_diag(&mut std::io::stderr(), msg);
+}
+
 fn usage(msg: impl std::fmt::Display) -> ! {
-    eprintln!("filmcraft-cli: {msg}\nRun `filmcraft-cli help` for usage.");
+    diag(format_args!("filmcraft-cli: {msg}\nRun `filmcraft-cli help` for usage."));
     std::process::exit(2)
 }
 
 fn fail(msg: impl std::fmt::Display) -> ! {
-    eprintln!("filmcraft-cli: {msg}");
+    diag(format_args!("filmcraft-cli: {msg}"));
     std::process::exit(1)
 }
 
@@ -198,14 +213,46 @@ fn format_for(path: &str) -> Option<&'static str> {
         "tif" | "tiff" => "tiff",
         "bmp" => "bmp",
         "aif" | "aiff" => "aiff",
+        "m4a" | "aac" => "aac",
         _ => return None,
     })
 }
 
 /// OS hardware video decoders (VideoToolbox on macOS, Media Foundation on Windows) in front of our
 /// own, as in the desktop app. Also what `mcp` and the headless commands decode with.
+/// The GPU export frame renderer (filmcraft-gpu's off-screen compositor behind filmcraft-export's
+/// frame-renderer hook): exports with GPU rendering Auto composite on the GPU and fall back to the
+/// CPU reference renderer wherever it cannot.
+struct GpuFrameRenderer(filmcraft_gpu::ExportRenderer);
+
+impl filmcraft_export::FrameRenderer for GpuFrameRenderer {
+    fn render(
+        &mut self,
+        project: &filmcraft_project::Project,
+        seq: filmcraft_project::ItemId,
+        t: filmcraft_time::Tick,
+        opts: filmcraft_render::RenderOptions,
+        sources: &dyn filmcraft_render::SourceProvider,
+    ) -> Option<filmcraft_render::Image> {
+        self.0.render(project, seq, t, opts, sources)
+    }
+}
+
+fn register_gpu_frame_renderer() {
+    filmcraft_export::register_frame_renderer(|| {
+        filmcraft_gpu::ExportRenderer::new().map(|r| Box::new(GpuFrameRenderer(r)) as Box<dyn filmcraft_export::FrameRenderer>)
+    });
+}
+
 fn register_hardware_decoders() -> filmcraft_platform::Availability {
     filmcraft_platform::register()
+}
+
+/// `path` made absolute against the working directory, as the project stores it. Unlike
+/// `canonicalize`, `std::path::absolute` keeps symlinks and adds no Windows verbatim `\\?\`
+/// prefix (#850). A path it cannot resolve is kept as given.
+fn absolute(path: &str) -> String {
+    std::path::absolute(path).ok().and_then(|p| p.into_os_string().into_string().ok()).unwrap_or_else(|| path.to_string())
 }
 
 #[tokio::main]
@@ -217,15 +264,24 @@ async fn main() {
 }
 
 async fn cli() {
-    if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
+    // `std::env::args` panics on an argument that is not Unicode (a Linux file name in Latin-1)
+    let a = Args::parse(std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()));
+    // `--help` anywhere (`filmcraft-cli --help`, `filmcraft-cli export --help`) prints the reference:
+    // the parser takes it as a flag option, so it never reaches the subcommand match.
+    if a.flag("--help") {
+        out!("{HELP}");
+        return;
+    }
+    // `--version` anywhere and `-V` as the subcommand, also after global options (`--demo --version`, #710).
+    if a.wants_version() {
         outln!("filmcraft-cli {}", env!("CARGO_PKG_VERSION"));
         return;
     }
     register_hardware_decoders();
-    let a = Args::parse(std::env::args().skip(1));
+    register_gpu_frame_renderer();
     let Some(cmd) = a.pos(0) else { usage("missing subcommand") };
     match cmd {
-        "help" | "--help" | "-h" => out!("{HELP}"),
+        "help" | "-h" => out!("{HELP}"),
         "version" => outln!("filmcraft-cli {}", env!("CARGO_PKG_VERSION")),
         "probe" => {
             let path = a.pos(1).unwrap_or_else(|| usage("probe <media> [--image-sequence]"));
@@ -329,8 +385,7 @@ async fn cli() {
             print(&a, &v);
         }
         "import" => {
-            let paths: Vec<String> =
-                a.positionals[1..].iter().map(|p| std::fs::canonicalize(p).map(|c| c.to_string_lossy().into_owned()).unwrap_or_else(|_| p.clone())).collect();
+            let paths: Vec<String> = a.positionals.get(1..).unwrap_or_default().iter().map(|p| absolute(p)).collect();
             if paths.is_empty() {
                 usage("import <file>...");
             }
@@ -373,16 +428,15 @@ async fn cli() {
             if let Some(r) = a.opt("--range") {
                 p["range"] = json!(r);
             }
-            if let (Some(s0), Some(s1)) = (a.opt("--start"), a.opt("--end")) {
-                p["range"] = json!("custom");
-                p["startSeconds"] = parse_value(s0);
-                p["endSeconds"] = parse_value(s1);
-            }
+            set_custom_bounds(&mut p, a.opt("--start"), a.opt("--end"));
             if let Some(js) = a.opt("--settings") {
                 p["settings"] = serde_json::from_str(js).unwrap_or_else(|e| usage(format!("--settings: {e}")));
             }
             if a.flag("--no-audio") {
                 p["audio"] = json!(false);
+            }
+            if let Some(v) = a.opt("--gpu-rendering") {
+                p["gpuRendering"] = json!(v); // off | auto (validated by the export command)
             }
             let mut b = Backend::open(&a);
             let t0 = std::time::Instant::now();
@@ -399,7 +453,9 @@ async fn cli() {
             match r {
                 Ok(v) => {
                     print(&a, &v);
-                    eprintln!("exported {} in {:.1}s", written_paths(&v, out).join(", "), t0.elapsed().as_secs_f64());
+                    let written = written_paths(&v, out).join(", ");
+                    check_offline(&a, &offline_media(&v), &format!("export: {written}"));
+                    diag(format_args!("exported {written} in {:.1}s", t0.elapsed().as_secs_f64()));
                 }
                 Err(e) => fail(format!("export: {e}")),
             }
@@ -414,15 +470,20 @@ async fn cli() {
             let out = a.opt("--out").unwrap_or("frame.png");
             s.set_playhead(filmcraft_time::Tick::from_seconds_f64(secs));
             let t0 = std::time::Instant::now();
-            let Some(img) = s.render_program(scale) else { fail("no sequence") };
+            let (img, offline) = render_at_playhead(&s, scale).unwrap_or_else(|e| fail(e));
             let dt = t0.elapsed();
             let png = filmcraft_automation::png_rgba(img.w as u32, img.h as u32, img.over_black_rgba8(), 0).unwrap_or_else(|e| fail(e));
             std::fs::write(out, png).unwrap_or_else(|e| fail(format!("{out}: {e}")));
-            eprintln!("rendered {}x{} in {:.1} ms → {out}", img.w, img.h, dt.as_secs_f64() * 1000.0);
+            let offline: Vec<Value> = offline.iter().filter_map(|o| serde_json::to_value(o).ok()).collect();
+            check_offline(&a, &offline, &format!("render: {out}"));
+            diag(format_args!("rendered {}x{} in {:.1} ms → {out}", img.w, img.h, dt.as_secs_f64() * 1000.0));
         }
         "mcp" => {
+            if let Some(opt) = a.unknown_opt(&["--bridge", "--project", "--demo", "--data-dir"]) {
+                usage(format!("unknown mcp option `{opt}`"));
+            }
             let server = match a.opt("--bridge") {
-                Some(addr) => filmcraft_automation::FilmcraftMcp::bridge(addr).unwrap_or_else(|e| fail(e)),
+                Some(addr) => filmcraft_automation::FilmcraftMcp::bridge(addr).unwrap_or_else(|e| usage(e)),
                 None => match Backend::open(&a) {
                     Backend::Local(s) => filmcraft_automation::FilmcraftMcp::headless(*s),
                     Backend::Bridge(_) => usage("mcp: use --bridge ADDR to drive a running app"),
@@ -454,17 +515,103 @@ fn written_paths(result: &Value, requested: &str) -> Vec<String> {
     if paths.is_empty() { vec![requested.to_string()] } else { paths }
 }
 
+/// The offline items an export result reports (`offlineMedia` of a direct export, or of each
+/// queued item), once each.
+fn offline_media(result: &Value) -> Vec<Value> {
+    let lists = std::iter::once(result).chain(result.get("items").and_then(Value::as_array).into_iter().flatten());
+    let mut out: Vec<Value> = Vec::new();
+    for o in lists.filter_map(|r| r.get("offlineMedia").and_then(Value::as_array)).flatten() {
+        if !out.iter().any(|x| x.get("item") == o.get("item")) {
+            out.push(o.clone());
+        }
+    }
+    out
+}
+
+/// One stderr line per offline item that rendered as placeholder frames (#1054).
+fn offline_warning(offline: &[Value]) -> String {
+    let s = |o: &Value, k: &str| o.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let mut msg = format!("filmcraft-cli: warning: {} offline media item(s) rendered as placeholder frames:", offline.len());
+    for o in offline {
+        let id = o.get("item").and_then(Value::as_u64).map(|i| i.to_string()).unwrap_or_default();
+        msg.push_str(&format!("\n  item {id} {} ({}): {}", s(o, "name"), s(o, "status"), s(o, "path")));
+    }
+    msg
+}
+
+/// Warn about offline media on stderr; without `--allow-offline` that fails the run (exit 1), after
+/// the output (`what`) was written, so scripts don't take placeholder frames for the real picture.
+fn check_offline(a: &Args, offline: &[Value], what: &str) {
+    if offline.is_empty() {
+        return;
+    }
+    diag(format_args!("{}", offline_warning(offline)));
+    if !a.flag("--allow-offline") {
+        fail(format!("{what} has placeholder frames for offline media; relink it (exec media.relink …) or pass --allow-offline"));
+    }
+}
+
+/// The active sequence at the playhead with the offline items it drew, or the reason it cannot be
+/// rendered (no sequence, bad scale).
+fn render_at_playhead(s: &Session, scale: f32) -> Result<(filmcraft_engine::render::Image, Vec<filmcraft_engine::media_pool::OfflineMedia>), String> {
+    s.try_render_program_with_offline_at(scale, s.playhead()).map_err(|e| e.to_string())
+}
+
+/// `--start` / `--end` ask for a custom range. A lone bound is forwarded too, so the engine reports the missing one
+/// instead of the export silently running over the whole sequence.
+fn set_custom_bounds(p: &mut Value, start: Option<&str>, end: Option<&str>) {
+    if start.is_none() && end.is_none() {
+        return;
+    }
+    p["range"] = json!("custom");
+    if let Some(s0) = start {
+        p["startSeconds"] = parse_value(s0);
+    }
+    if let Some(s1) = end {
+        p["endSeconds"] = parse_value(s1);
+    }
+}
+
 #[cfg(test)]
 mod format_tests {
+    #[test]
+    fn render_reports_the_real_reason() {
+        let mut s = filmcraft_engine::Session::default();
+        assert!(super::render_at_playhead(&s, 0.5).unwrap_err().contains("sequence"));
+        s.execute("file.newSequence", serde_json::json!({"width": 16, "height": 16})).unwrap();
+        for scale in [0.0, -1.0, f32::NAN] {
+            let e = super::render_at_playhead(&s, scale).unwrap_err();
+            assert!(e.contains("finite and positive"), "{e}");
+        }
+        assert_eq!(super::render_at_playhead(&s, 0.5).unwrap().0.w, 8);
+    }
+
     /// The CLI (and MCP / headless runs, which share its entry point) registers the hardware
     /// decoders at start-up.
     #[test]
     fn startup_registers_the_hardware_decoders() {
         let hardware = super::register_hardware_decoders();
-        // always on macOS and Windows; on Linux when a VA-API driver is there
+        // always on macOS and Windows; on Linux when a VA-API driver or NVIDIA's driver (NVDEC) is there
         let expected = cfg!(any(target_os = "macos", target_os = "windows"))
             || (cfg!(target_os = "linux") && matches!(hardware, filmcraft_platform::Availability::Available(_)));
         assert_eq!(filmcraft_platform::registered(), expected, "{hardware:?}");
+    }
+
+    #[test]
+    fn a_failing_diagnostic_stream_does_not_panic() {
+        struct Closed;
+        impl std::io::Write for Closed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        super::write_diag(&mut Closed, format_args!("exported {}", "a.wav"));
+        let mut ok = Vec::new();
+        super::write_diag(&mut ok, format_args!("hi"));
+        assert_eq!(ok, b"hi\n");
     }
 
     #[test]
@@ -476,6 +623,57 @@ mod format_tests {
         assert_eq!(super::written_paths(&queued, "a.mp4"), ["a.mp4.mov", "b.wav"]);
         assert_eq!(super::written_paths(&json!({}), "x.mov"), ["x.mov"]);
         assert_eq!(super::written_paths(&json!({"items": []}), "x.mov"), ["x.mov"]);
+    }
+
+    #[test]
+    fn offline_media_from_direct_and_queued_results() {
+        use serde_json::json;
+        let a = json!({"item": 8, "name": "a.mp4", "path": "/m/a.mp4", "status": "missing", "error": ""});
+        let b = json!({"item": 9, "name": "b.mov", "path": "/m/b.mov", "status": "offline", "error": ""});
+        assert_eq!(super::offline_media(&json!({"path": "x.mp4", "offlineMedia": [a]})), std::slice::from_ref(&a));
+        let queued = json!({"items": [{"offlineMedia": [a, b]}, {"offlineMedia": [a]}, {"offlineMedia": []}]});
+        assert_eq!(super::offline_media(&queued), [a.clone(), b.clone()]);
+        assert!(super::offline_media(&json!({"path": "x.mp4"})).is_empty());
+        let w = super::offline_warning(&[a, b]);
+        assert!(w.contains("2 offline media item(s)") && w.contains("item 8 a.mp4 (missing): /m/a.mp4") && w.contains("item 9 b.mov (offline)"), "{w}");
+    }
+
+    #[test]
+    fn export_lone_bound_is_forwarded_as_custom_range() {
+        use serde_json::json;
+        let mut p = json!({});
+        super::set_custom_bounds(&mut p, Some("0.25"), None);
+        assert_eq!(p["range"], "custom");
+        assert_eq!(p["startSeconds"], 0.25);
+        assert!(p.get("endSeconds").is_none());
+        let mut p = json!({});
+        super::set_custom_bounds(&mut p, None, Some("0.25"));
+        assert_eq!(p["range"], "custom");
+        assert_eq!(p["endSeconds"], 0.25);
+        let mut p = json!({});
+        super::set_custom_bounds(&mut p, None, None);
+        assert!(p.get("range").is_none());
+    }
+
+    /// `import` used `canonicalize`, which resolves symlinks and on Windows stores `\\?\C:\…`
+    /// verbatim paths in the project (#850).
+    #[test]
+    fn imported_paths_are_absolute_without_resolving_links() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(super::absolute("clip.mov"), cwd.join("clip.mov").to_string_lossy());
+        assert!(!super::absolute("clip.mov").starts_with(r"\\?\"));
+        assert_eq!(super::absolute(""), "");
+        #[cfg(unix)]
+        {
+            let dir = std::env::temp_dir().join(format!("filmcraft-cli-abs-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("real.mov"), b"x").unwrap();
+            let link = dir.join("link.mov");
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(dir.join("real.mov"), &link).unwrap();
+            assert_eq!(super::absolute(&link.to_string_lossy()), link.to_string_lossy());
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     #[test]

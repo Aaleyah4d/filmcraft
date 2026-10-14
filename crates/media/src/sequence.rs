@@ -3,10 +3,12 @@
 //! - [`Numbered`] splits a file name around its last run of digits; [`sequence_frames`] lists the
 //!   frames from the chosen file's number up to the highest number present (gaps are `None`).
 //! - [`ImageSequenceSource`] decodes frames on demand through a [`FrameLoader`] (the host's file
-//!   access) with the still decoders (PNG, JPEG, TIFF, BMP, WebP, GIF), keeps recently used frames
-//!   in a byte-budgeted [`FrameCache`], and shows the nearest earlier frame for a missing or
-//!   undecodable one (the nearest later frame before the first).
-//! - The frame rate is the caller's (Settings ▸ Media ▸ Indeterminate Media Timebase).
+//!   access) with the still decoders (PNG, JPEG, TIFF, BMP, WebP, GIF, Targa, DPX; OpenEXR and DNG
+//!   camera raw as linear float frames), keeps recently used frames in a byte-budgeted
+//!   [`FrameCache`], and shows the nearest earlier frame for a missing or undecodable one (the
+//!   nearest later frame before the first).
+//! - The frame rate is the caller's (Settings ▸ Media ▸ Indeterminate Media Timebase), except for
+//!   CinemaDNG: a frame rate and start time code in the first frame's tags are the sequence's.
 
 use std::sync::Arc;
 
@@ -75,7 +77,15 @@ impl Numbered {
 
     /// The frame number of a sibling file name of this sequence (same prefix, suffix and padding).
     pub fn number_of(&self, file_name: &str) -> Option<u64> {
-        let mid = file_name.strip_prefix(self.prefix.as_str())?.strip_suffix(self.suffix.as_str())?;
+        let rest = file_name.strip_prefix(self.prefix.as_str())?;
+        let mid = {
+            let n = rest.as_bytes();
+            let s = self.suffix.as_bytes();
+            if n.len() < s.len() || !n[n.len() - s.len()..].eq_ignore_ascii_case(s) {
+                return None;
+            }
+            &rest[..n.len() - s.len()]
+        };
         if mid.is_empty() || !mid.bytes().all(|b| b.is_ascii_digit()) || mid.len() > 18 {
             return None;
         }
@@ -126,9 +136,12 @@ impl ImageSequenceSource {
         let bytes = loader(&first).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound { MediaError::Offline(format!("{first}: {e}")) } else { MediaError::Io(format!("{first}: {e}")) }
         })?;
-        let img = image::load_from_memory(&bytes).map_err(|e| MediaError::Decode(format!("{first}: {e}")))?;
-        let has_alpha = img.color().has_alpha();
-        let (w, h) = (img.width(), img.height());
+        let (frame, has_alpha, pixel_format, timing) = decode_frame(&first, &bytes)?;
+        let (w, h) = (frame.width, frame.height);
+        let (rate, start_timecode) = match timing {
+            Some(info) => crate::still::dng::sequence_timing(&info, rate),
+            None => (rate, None),
+        };
         let ext = first.rsplit('.').next().unwrap_or("image").to_ascii_uppercase();
         let n = frames.len() as i64;
         let info = MediaInfo {
@@ -141,19 +154,19 @@ impl ImageSequenceSource {
                 frame_rate: rate,
                 par: (1, 1),
                 codec: format!("{ext} sequence"),
-                pixel_format: if has_alpha { "RGBA 8-bit".into() } else { "RGB 8-bit".into() },
-                color: filmcraft_color::ColorInfo::SRGB_FULL,
+                pixel_format,
+                color: frame.color,
                 has_alpha,
                 bitrate: None,
                 hdr: None,
             }),
             audio_streams: Vec::new(),
             container: "Image Sequence".into(),
-            start_timecode: None,
+            start_timecode,
             file_size: None,
         };
         let cache = FrameCache::new(256 << 20);
-        cache.insert(frames.iter().position(Option::is_some).unwrap_or(0), Arc::new(VideoFrame::rgba8(w, h, img.to_rgba8().into_raw())));
+        cache.insert(frames.iter().position(Option::is_some).unwrap_or(0), Arc::new(frame));
         Ok(Self { info, frames, loader, cache })
     }
 
@@ -175,10 +188,9 @@ impl ImageSequenceSource {
         if let Some(f) = self.cache.get(&i) {
             return Ok(f);
         }
-        let path = self.frames[i].as_deref().ok_or(MediaError::NoStream("video"))?;
+        let path = self.frames.get(i).and_then(|f| f.as_deref()).ok_or(MediaError::NoStream("video"))?;
         let bytes = (self.loader)(path).map_err(|e| MediaError::Io(format!("{path}: {e}")))?;
-        let img = image::load_from_memory(&bytes).map_err(|e| MediaError::Decode(format!("{path}: {e}")))?;
-        let f = Arc::new(VideoFrame::rgba8(img.width(), img.height(), img.to_rgba8().into_raw()));
+        let f = Arc::new(decode_frame(path, &bytes)?.0);
         self.cache.insert(i, f.clone());
         Ok(f)
     }
@@ -209,6 +221,27 @@ impl MediaSource for ImageSequenceSource {
     }
 }
 
+/// Decode one frame file: OpenEXR, Radiance HDR and DNG camera raw as linear floats (DNG with its metadata, for
+/// the sequence's timing), every other format through the still decoders as RGBA8. Returns the
+/// frame, whether it has alpha, and its pixel format for the media info.
+fn decode_frame(name: &str, bytes: &[u8]) -> Result<(VideoFrame, bool, String, Option<filmcraft_dng::Info>)> {
+    if crate::still::exr::sniff(bytes) {
+        let d = crate::still::exr::decode(name, bytes)?;
+        return Ok((d.frame, d.has_alpha, d.pixel_format, None));
+    }
+    if crate::still::hdr::sniff(bytes) {
+        let frame = crate::still::hdr::decode(name, bytes)?;
+        return Ok((frame, false, "RGB 32-bit float (RGBE)".to_string(), None));
+    }
+    if crate::still::dng::sniff(bytes) {
+        let d = crate::still::dng::decode(name, bytes)?;
+        return Ok((d.frame, false, d.pixel_format, Some(d.info)));
+    }
+    let img = crate::still::decode_raster(name, bytes)?;
+    let pixel_format = if img.has_alpha { "RGBA 8-bit" } else { "RGB 8-bit" }.to_string();
+    Ok((VideoFrame::rgba8(img.width, img.height, img.rgba), img.has_alpha, pixel_format, None))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +264,7 @@ mod tests {
         assert!(!u.padded());
         assert_eq!(u.file_name(10), "frame10.TIF");
         assert_eq!(u.number_of("frame10.TIF"), Some(10));
+        assert_eq!(u.number_of("frame10.tif"), Some(10), "Linux stills often mix .TIF and .tif");
         assert_eq!(Numbered::parse("clip.mov"), None, "not a still");
         assert_eq!(Numbered::parse("nodigits.png"), None);
         let w = Numbered::parse("C:\\renders\\out.0010.exr.png").unwrap();

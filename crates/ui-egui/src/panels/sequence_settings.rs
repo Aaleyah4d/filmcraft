@@ -12,7 +12,7 @@
 //!
 //! Premiere settings FilmCraft has no equivalent for yet are shown greyed out with their current
 //! value and a "not supported yet" hint, rather than editable and silently ignored: Editing Mode,
-//! Pixel Aspect Ratio (stored, not rendered), Fields, the Frames and Feet + Frames display
+//! Pixel Aspect Ratio (rendered, and set by New Sequence From Clip, but not editable here yet), Fields, the Frames and Feet + Frames display
 //! formats, Number of Channels, audio Display Format, the Video Previews format, codec and size,
 //! Maximum Bit Depth, and the VR Properties tab. Composite in Linear Color is shown on and greyed:
 //! FilmCraft always composites in linear light.
@@ -150,7 +150,7 @@ fn tracks(ui: &mut egui::Ui, d: &mut SequenceSettingsDraft, elems: &mut Elems) {
     for (id, label, n) in [("video", "Video:", &mut d.video_tracks), ("audio", "Audio:", &mut d.audio_tracks)] {
         ui.horizontal(|ui| {
             ui.label(t(label));
-            let r = ui.add(egui::DragValue::new(n).range(0..=256));
+            let r = ui.add(crate::widgets::number_drag(n).range(0..=256));
             elems.push((format!("sequenceSettings.tracks.{id}"), r.rect, n.to_string()));
             ui.label(tl!("tracks"));
         });
@@ -172,6 +172,12 @@ fn aspect(w: u32, h: u32) -> String {
     } else {
         String::new()
     }
+}
+
+/// The width a `w` x `h` frame with `par` pixels shows at, in square pixels (rounded).
+fn display_width(w: u32, h: u32, par: (u32, u32)) -> u32 {
+    let dw = filmcraft_project::conformed_size((w, h), par, (1, 1)).0.round();
+    if dw >= f64::from(u32::MAX) { u32::MAX } else { dw.max(0.0) as u32 }
 }
 
 fn gcd(mut a: u32, mut b: u32) -> u32 {
@@ -325,13 +331,14 @@ fn general(ui: &mut egui::Ui, d: &mut SequenceSettingsDraft, cur: &SequenceSetti
     });
     section(ui, "Video", |ui| {
         row(ui, label_w, "Frame Size:", true, |ui| {
-            let w = ui.add(egui::DragValue::new(&mut d.width).range(1..=filmcraft_project::MAX_FRAME_SIDE).speed(1.0));
+            let w = ui.add(crate::widgets::number_drag(&mut d.width).range(1..=filmcraft_project::MAX_FRAME_SIDE).speed(1.0));
             elems.push(("sequenceSettings.width".into(), w.rect, d.width.to_string()));
             ui.label(tl!("horizontal"));
-            let h = ui.add(egui::DragValue::new(&mut d.height).range(1..=filmcraft_project::MAX_FRAME_SIDE).speed(1.0));
+            let h = ui.add(crate::widgets::number_drag(&mut d.height).range(1..=filmcraft_project::MAX_FRAME_SIDE).speed(1.0));
             elems.push(("sequenceSettings.height".into(), h.rect, d.height.to_string()));
             ui.label(tl!("vertical"));
-            let a = aspect(d.width, d.height);
+            // the display aspect: 1440 x 1080 with 4:3 pixels is 16:9
+            let a = aspect(display_width(d.width, d.height, cur.par), d.height);
             let ar = ui.label(&a);
             elems.push(("sequenceSettings.aspect".into(), ar.rect, a));
         });
@@ -468,6 +475,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
     let audio_samples = app.session.project.settings.audio_display_samples;
     let accent = app.tokens.accent;
     let mut d = app.ui.sequence_settings.clone();
+    crate::widgets::revert_drag_on_escape(ctx, egui::Id::new("sequence-settings-before-drag"), &mut d);
     let mut keep = true;
     let mut apply = false;
     let mut elems: Elems = Vec::new();
@@ -483,7 +491,8 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
         .collapsible(false)
         .resizable(false)
         .default_width(620.0)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .pivot(egui::Align2::CENTER_CENTER)
+        .default_pos(crate::widgets::dialog_center(ctx))
         .show(ctx, |ui| {
             ui.set_width(620.0);
             ui.horizontal(|ui| {
@@ -519,7 +528,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
     for (id, r, l) in elems {
         app.auto.add(&id, r, &l);
     }
-    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+    if crate::widgets::escape_closes(ctx) {
         keep = false;
     }
     if ctx.input(|i| i.key_pressed(egui::Key::Enter)) && !ctx.egui_wants_keyboard_input() {
@@ -533,9 +542,12 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
             .and_then(|_| if rest.is_empty() { Ok(Value::Null) } else { app.session.execute("sequence.settings", Value::Object(rest)) });
         if let Err(e) = r {
             app.ui.status = e.to_string();
+            keep = true;
+        } else {
+            keep = false;
         }
         app.ui.sequence_settings = d;
-        return false;
+        return keep;
     }
     if apply {
         let p = changes(&d, &cur, &cur_name);
@@ -544,8 +556,10 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
             && let Err(e) = app.session.execute("sequence.settings", Value::Object(p))
         {
             app.ui.status = e.to_string();
+            keep = true;
+        } else {
+            keep = false;
         }
-        keep = false;
     }
     app.ui.sequence_settings = d;
     keep
@@ -562,6 +576,11 @@ mod tests {
         assert_eq!(aspect(1080, 1920), "9:16");
         assert_eq!(aspect(1440, 1080), "4:3");
         assert_eq!(aspect(4096, 2160), "1.90:1");
+        // non-square pixels: the display aspect
+        assert_eq!(aspect(display_width(1440, 1080, (4, 3)), 1080), "16:9");
+        assert_eq!(aspect(display_width(1280, 1080, (3, 2)), 1080), "16:9");
+        assert_eq!(display_width(u32::MAX, 1, (8, 1)), u32::MAX);
+        assert_eq!(display_width(1440, 1080, (0, 0)), 1440);
     }
 
     #[test]

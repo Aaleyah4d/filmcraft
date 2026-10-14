@@ -21,12 +21,12 @@ writing them is `crates/format` (`filmcraft-format`); the engine's `file.*` comm
   clips, effects, keyframes, markers). Media is referenced by path, never embedded.
 - Files are written compact (no indentation). A 2,000-clip project is about 1.4 MB.
 - `view` (optional) is what was open when the project was saved: the Timeline's sequence tabs in
-  order, the active one, and each sequence's zoom, scroll and track heights
-  (`filmcraft_project::ProjectView`). It is beside the project, not in it: it is not part of the
+  order, the active one, each sequence's zoom, scroll and track heights, and each sequence's
+  playhead (`filmcraft_project::ProjectView`). It is beside the project, not in it: it is not part of the
   edit, never an undo step, and changing it does not mark the project as changed. Opening a
   project restores it when the Timeline preference "Restore open sequences when opening projects"
   is on. It is outside the schema version: older builds ignore it, ids that are not sequences and
-  numbers out of range are dropped or clamped, and a `view` that cannot be read is ignored (the
+  numbers out of range are dropped or clamped (a playhead also snaps to a frame of its sequence), and a `view` that cannot be read is ignored (the
   project opens on its first sequence, as it does without one or with no open sequence in it).
 - A coordinate of an effect's point parameter may be `null`. Point parameters use NaN for "auto"
   (the frame centre, or the source centre for `anchor`), and JSON writes NaN as `null`; it reads back
@@ -152,9 +152,11 @@ Premiere's auto-save can lose up to one interval of work. FilmCraft also keeps a
   over the original file. The recovered state goes into the new session's own journal before the old
   journal is deleted.
 - A normal quit with nothing unsaved removes the session directory. Quitting with unsaved changes
-  keeps the snapshot, marked `cleanExit`, and FilmCraft offers it on the next launch ("FilmCraft was
-  closed while … had unsaved changes"). There is no "Save changes?" prompt on quit yet, so this
-  keeps the work.
+  (Quit, Cmd+Q or the window's close button) first asks *"Save changes to 'X' before closing?"*
+  with **Cancel**, **Don't Save** and **Save** (Save on a never-saved project opens the Save dialog);
+  Don't Save discards the changes and their snapshot. A quit that does not ask (the control
+  channel's `app.quit`, the OS ending the session) keeps the snapshot, marked `cleanExit`, and FilmCraft offers it on the next launch ("FilmCraft was
+  closed while … had unsaved changes").
 
 Desktop flags: `--recover` recovers the newest candidate without asking. `--no-recover` starts
 without asking; the changes stay available through File ▸ Recover Unsaved Changes…. `--data-dir
@@ -215,13 +217,13 @@ opens the dialog on a page.
 | Category | Takes effect |
 |---|---|
 | General | At Startup (Show Home = demo project, Open Most Recent, empty project; recent projects are remembered on open/save), Show Tool Tips |
-| Appearance | Color Theme (Darkest / Dark / Light; View ▸ Appearance writes it too), highlight colour, accessible contrast |
+| Appearance | Appearance Mode `appearanceMode` (`auto` = Sync with system / `dark` (default) / `light`; the header button and View ▸ Appearance ▸ Next Appearance Mode cycle it), Dark Theme `darkTheme` (`darkest` (default) / `dark`), Light Theme `lightTheme` (`light`), highlight colour, accessible contrast. `colorTheme` (Darkest / Dark / Light) is legacy input: setting it (older files and clients, View ▸ Appearance ▸ a theme) selects that theme and fixes the mode to its family; a file without `appearanceMode` migrates to its theme's fixed mode. It is kept in line with the choices: the theme a fixed mode shows, the dark theme in Auto |
 | Audio | Automatch Time, Large Volume Adjustment, automation keyframe thinning (linear, minimum time) |
 | Audio Hardware | device class (cpal host), output device, I/O buffer size, sample rate, force document rate, Output Mapping (programme L/R → device channels) |
 | Auto Save | the auto-save ring and the crash-recovery journal |
 | Color | stored only (display colour management, EDR monitoring, HDR graphics white) |
 | Graphics | new text layers: smart quotes, ligatures, default font |
-| Labels | the 16 label names and colours (timeline, Project panel, Edit ▸ Label), label defaults for imported movies / video / audio / stills and new sequences |
+| Labels | the 16 label names and colours (timeline, Project panel, Edit ▸ Label), label defaults for imported movies / video / audio / stills and new sequences, Label Color Presets: JSON files (`{"name", "labels": [16 × {"name", "color": "#rrggbb"}]}`) in `<data dir>/Label Presets`, built in: "Default" (the labels FilmCraft ships with), "Bright" (16 saturated hues) and "Roles" (B-Roll, Footage, Dialogue… named so the label defaults land on matching roles) (`labels.presets`, `labels.importPreset {path}`, `labels.exportPreset {path}`, `labels.deletePreset {name}`; `labels.preset` is the selected one) |
 | Media | Indeterminate Media Timebase (frame rate of stills), Default Media Scaling (Scale to / Set to frame size when a clip of another size is edited in), Enable proxies |
 | Media Analysis & Transcription | auto-transcribe imported clips (scope "all imported"), speech model, default language / auto-detect, speaker labelling (defaults of `transcript.generate`) |
 | Media Cache | location (`<data dir>/Media Cache` by default; unsaved projects' render previews live there), automatic deletion (older than N days / beyond N GB), Delete… (`mediaCache.clean {all?}`, `mediaCache.info`) |
@@ -359,6 +361,11 @@ destination?, preset?}` (Project Settings ▸ Ingest) acts on every `file.import
   clip to the result when it is done;
 - **createProxies** makes proxies in the background and attaches them;
 - **copyAndCreateProxies** does both.
+
+Copied files keep their names when available; collisions receive a numbered suffix before the
+extension (`A001 2.mov`) and never replace an existing file. Transcodes reserve distinct output
+names for every clip in the import batch. Copies keep their source fingerprint, and each proxy
+stays attached to its corresponding take.
 
 `file.import` reports this under `ingest`.
 

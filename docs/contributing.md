@@ -40,6 +40,7 @@ cargo xtask web --serve 8765                          # the web app on http://12
 |---|---|
 | `FILMCRAFT_CONTROL_PORT` | Same as `--control <port>` |
 | `FILMCRAFT_CPU_COMPOSITE=1` | Disables the GPU compositor |
+| `FILMCRAFT_DEV_DESKTOP_ENTRY=1` | Linux, opt-in: a run from a source tree installs a user-level desktop entry (and the icons from `assets/app-icon`) so the taskbar shows the FilmCraft icon. Nothing is written without it; packaged runs never write one |
 | `FILMCRAFT_DATA_DIR` | Same as `--data-dir <dir>`: auto-save, crash recovery, settings and logs |
 | `RUST_LOG` | Log levels for standard error and the log file (see [Logs](#logs)) |
 
@@ -99,6 +100,14 @@ Web builds depend on the font faces selected by `crates/text/build.rs`; they can
 `theme::tests::chinese_names_render_in_every_theme_and_font_family` verifies Chinese glyphs in the
 timeline's proportional, monospace, medium and semibold families under all three themes.
 
+Arabic and Hebrew work the same way (`crates/ui-egui/src/rtl.rs`): the `Arab` / `Hebr` craft-fonts
+faces, else one installed face per script (for example Noto Sans Arabic, SF Arabic or Segoe UI),
+are the last fallbacks of every UI font family. egui shapes each font run (letters join) but lays
+runs out left to right with no bidi pass, so captions on the timeline and in the Text panel are laid
+out in reading order by `rtl::Lines` (UAX #9 via unicode-bidi, each right-to-left word its own layout
+section). A caption being edited shows egui's logical order, since `TextEdit` places the caret by
+character index.
+
 ## 3. Quality gates
 
 Every commit must pass all of these:
@@ -135,7 +144,7 @@ comes with a regression test; parsers, decoders and commands get fuzz / hostile-
   [ROADMAP.md](../ROADMAP.md). If your change has no task id, use the area: `docs: …`,
   `README: …`, `ROADMAP: …`.
 - Commit only green states (all gates pass).
-- When a milestone lands, update its row in `ROADMAP.md` (status, what's done, estimates).
+- When a milestone lands, update its row in [roadmap.md](roadmap.md) (status, what's done, estimates), the summary in `ROADMAP.md`, and the parity doc and [gaps.md](gaps.md) entry it moves, with their "Last updated" lines and revision history.
 - AI agents end commit messages with the attribution line their environment requires.
 
 ## 5. Parallel work (several agents or worktrees)

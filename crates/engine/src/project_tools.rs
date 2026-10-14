@@ -14,6 +14,7 @@
 //! | `file.projectSettings.general` / `.scratchDisks` | File ▸ Project Settings ▸ General… / Scratch Disks… |
 //! | `edit.find` / `edit.findNext` | Edit ▸ Find… (⌘F) / Find Next |
 //! | `edit.editOriginal` | Edit ▸ Edit Original (⌘E): the frontend opens the files |
+//! | `file.reveal` | Project panel ▸ Reveal in Finder / Show in Explorer: the frontend reveals the media file |
 //! | `clip.editOffline` | Clip ▸ Edit Offline… |
 //! | `clip.sourceSettings` | Clip ▸ Source Settings… |
 //! | `clip.restoreCaptionsFromSource` | Clip ▸ Restore Captions from Source Clip (always disabled: no embedded caption reader) |
@@ -22,7 +23,7 @@
 //! | `clip.automateToSequence` | Clip ▸ Automate to Sequence… |
 //! | `help.systemReport` | query behind Help ▸ System Compatibility Report… |
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use filmcraft_project::{BinEntry, FindOp, FindQuery, FindRow, ItemId, ItemKind, MarkerKind, MediaRef, Project, SearchBin, TrackKind};
 use filmcraft_time::{Tick, TimeDisplay, TimeRange};
@@ -163,6 +164,8 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         spec("edit.find", "Find…", &["Edit"], Some("Cmd+F"), FIND_PARAMS, always, find),
         spec("edit.findNext", "Find Next", &["Edit"], None, "{}", has_find, find_next),
         spec("edit.editOriginal", "Edit Original", &["Edit"], Some("Cmd+E"), r#"{"items":[id]?}"#, has_original, edit_original),
+        // Project panel context menu (not in the File menu): reveal the clip's media file.
+        query("file.reveal", "Reveal in Finder", &[], None, r#"{"items":[id]?}"#, has_file_selection, edit_original),
         // ---------------- Clip ----------------
         spec(
             "clip.editOffline",
@@ -699,14 +702,54 @@ fn new_from_template(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// The selected items plus everything they need: sequence contents (recursively), subclip
 /// parents, multi-camera / merged-clip sources and graphic canvases.
+///
+/// Bins and items share one id space, so a named bin contributes every item it holds (and
+/// everything those items need), as `project.delete` does. The project's own top bin does not,
+/// since no command acts on it (#244), and only ids that name a real item end up in the result.
 pub fn closure(p: &Project, roots: &[ItemId]) -> BTreeSet<ItemId> {
+    // Index the bin tree once. Told apart from items with a set membership test (rather than a
+    // full `find_bin` per queued id, which is O(n²) when exporting many items from a flat
+    // project) and expanded from the indexed children (rather than a second walk per bin).
+    let mut bins: BTreeSet<u64> = BTreeSet::new();
+    let mut children: BTreeMap<u64, (Vec<ItemId>, Vec<u64>)> = BTreeMap::new();
+    let mut bin_stack = vec![&p.root];
+    while let Some(b) = bin_stack.pop() {
+        bins.insert(b.id.0);
+        let mut direct = (Vec::new(), Vec::new());
+        for c in &b.children {
+            match c {
+                BinEntry::Item(i) => direct.0.push(*i),
+                BinEntry::Bin(x) => {
+                    direct.1.push(x.id.0);
+                    bin_stack.push(x);
+                }
+            }
+        }
+        children.insert(b.id.0, direct);
+    }
+
     let mut keep: BTreeSet<ItemId> = BTreeSet::new();
     let mut todo: Vec<ItemId> = roots.to_vec();
+    let mut seen_bins: BTreeSet<u64> = BTreeSet::new();
+    let mut bin_todo: Vec<u64> = Vec::new();
     while let Some(id) = todo.pop() {
-        if !keep.insert(id) {
+        if bins.contains(&id.0) && id.0 != p.root.id.0 {
+            bin_todo.push(id.0);
+            while let Some(bid) = bin_todo.pop() {
+                if !seen_bins.insert(bid) {
+                    continue;
+                }
+                if let Some((items, subs)) = children.get(&bid) {
+                    todo.extend(items.iter().copied());
+                    bin_todo.extend(subs.iter().copied());
+                }
+            }
             continue;
         }
         let Some(it) = p.item(id) else { continue };
+        if !keep.insert(id) {
+            continue;
+        }
         match &it.kind {
             ItemKind::Subclip { parent, .. } => todo.push(*parent),
             ItemKind::Sequence(q) => {
@@ -740,6 +783,7 @@ pub fn project_subset(p: &Project, keep: &BTreeSet<ItemId>) -> Project {
     out.items.retain(|id, _| keep.contains(id));
     prune(&mut out.root, keep);
     out.transcripts.retain(|id, _| keep.contains(id));
+    out.narrations.retain(|id, _| keep.contains(id));
     out.search_bins.clear();
     out
 }
@@ -754,6 +798,9 @@ fn export_selection(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad("file.exportSelectionProject", "select items in the Project panel"));
     }
     let keep = closure(&s.project, &roots);
+    if keep.is_empty() {
+        return Err(bad("file.exportSelectionProject", "the selection has no items to export"));
+    }
     let mut sub = project_subset(&s.project, &keep);
     let name = std::path::Path::new(&path).file_stem().map(|x| x.to_string_lossy().to_string()).unwrap_or_else(|| sub.name.clone());
     sub.name = name.clone();
@@ -1127,7 +1174,8 @@ fn automate_to_sequence(s: &mut Session, p: &Value) -> Result<Value> {
         let d = rate.tick_of(rate.frame_at(r.duration + Tick(fd.0 / 2)).max(1));
         plan.push((*id, TimeRange::new(r.start, d)));
     }
-    // destinations
+    // destinations. `cut_overlap[k]` is the overlap between clip k and k+1 (placement-clamped).
+    let mut cut_overlap: Vec<Tick> = Vec::new();
     let starts: Vec<Tick> = if placement == "unnumberedMarkers" {
         let mut m: Vec<Tick> = q.markers.iter().filter(|m| m.name.is_empty() && m.kind == MarkerKind::Comment).map(|m| rate.snap(m.start)).collect();
         m.sort();
@@ -1145,6 +1193,7 @@ fn automate_to_sequence(s: &mut Session, p: &Value) -> Result<Value> {
             if k > 0 {
                 let prev = plan[k - 1].1.duration;
                 let ov = overlap.min(Tick(prev.0 / 2)).min(Tick(r.duration.0 / 2));
+                cut_overlap.push(ov);
                 at -= rate.snap(ov);
             }
             v.push(at);
@@ -1195,20 +1244,23 @@ fn automate_to_sequence(s: &mut Session, p: &Value) -> Result<Value> {
     let mut transitions = 0;
     if placement == "sequentially" && (vt || at) {
         let q = s.active_sequence().ok_or(EngineError::NoSequence)?;
+        let default_frames = s.project.settings.default_transition_duration_frames;
         let mut edges = Vec::new();
-        for (_, ids) in placed.iter().skip(1) {
+        for ((_, ids), ov) in placed.iter().skip(1).zip(cut_overlap.iter().chain(std::iter::repeat(&overlap))) {
+            let frames = if *ov > Tick::ZERO { rate.frame_at(*ov) } else { default_frames };
             for c in ids {
                 let Some((tid, _)) = q.find_item(*c) else { continue };
                 let kind = q.track(tid).map(|t| t.kind);
-                if (kind == Some(TrackKind::Video) && vt) || (kind == Some(TrackKind::Audio) && at) {
-                    edges.push((*c, kind == Some(TrackKind::Video)));
-                }
+                let cmd = match kind {
+                    Some(TrackKind::Video) if vt => "sequence.applyVideoTransition",
+                    Some(TrackKind::Audio) if at => "sequence.applyAudioTransition",
+                    _ => continue,
+                };
+                edges.push((cmd, *c, frames));
             }
         }
-        let frames = if overlap > Tick::ZERO { rate.frame_at(overlap) } else { s.project.settings.default_transition_duration_frames };
-        for (c, video) in edges {
-            let id = if video { "sequence.applyVideoTransition" } else { "sequence.applyAudioTransition" };
-            if s.execute(id, json!({"clip": c.0, "edge": "in", "frames": frames})).is_ok() {
+        for (cmd, c, frames) in edges {
+            if s.execute(cmd, json!({"clip": c.0, "edge": "in", "frames": frames})).is_ok() {
                 transitions += 1;
             }
         }
@@ -1235,7 +1287,7 @@ pub fn system_report() -> Value {
         "family": std::env::consts::FAMILY,
         "arch": std::env::consts::ARCH,
         "cpuThreads": cpus,
-        "decoders": ["H.264 (AVC)", "H.265 (HEVC) Main / Main 10", "VP9", "AV1 Main", "Apple ProRes", "Avid DNxHD / DNxHR", "Motion JPEG", "AAC-LC", "Opus", "PCM"],
+        "decoders": ["H.264 (AVC)", "H.265 (HEVC) Main / Main 10", "VP8", "VP9", "AV1 Main", "Apple ProRes", "Avid DNxHD / DNxHR", "Motion JPEG", "AAC-LC", "Opus", "PCM"],
         "containers": ["MP4 / MOV (ISO BMFF)", "Matroska / WebM", "WAV", "PNG / JPEG stills"],
         "exportFormats": formats,
         "speechToText": crate::transcript::speech_available(),

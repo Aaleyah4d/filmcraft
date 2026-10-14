@@ -263,3 +263,82 @@ fn the_scroll_bar_thumb_follows_the_pointer_and_reaches_both_ends() {
     let (scroll, pps, ..) = d.view();
     assert!(pps < 50.0 && (scroll - at).abs() < 1e-6, "{pps} {scroll}");
 }
+
+/// Show Video Thumbnails ▸ Continuous asks for frames across each video clip, not only its head;
+/// `ui.set` switches the mode (and Off) and refuses an unknown one.
+#[test]
+fn continuous_video_thumbnails_ask_for_frames_across_each_clip() {
+    let mut d = Driver::demo();
+    d.ok("ui.set", json!({"timeline": {"thumbnails": "head", "pps": 50.0, "scroll": 0.0}}));
+    d.view();
+    d.frames(10);
+    let head = d.app().frames.stats().request_misses;
+    d.ok("ui.set", json!({"timeline": {"thumbnails": "continuous"}}));
+    d.frames(3);
+    let continuous = d.app().frames.stats().request_misses;
+    assert!(continuous >= head + 5, "continuous thumbnails queued {} more frames", continuous - head);
+    let tl = d.ok("ui.inspect", none())["ui"]["timeline"].clone();
+    assert_eq!((tl["show_thumbnails"].clone(), tl["thumbnail_mode"].clone()), (json!(true), json!("Continuous")));
+    d.ok("ui.set", json!({"timeline": {"thumbnails": "off"}}));
+    assert!(!d.app().ui.timeline.show_thumbnails);
+    let v = d.call("ui.set", json!({"timeline": {"thumbnails": "filmstrip"}}));
+    assert_eq!(v["ok"], json!(false), "{v}");
+    assert!(!d.app().ui.timeline.show_thumbnails);
+}
+
+#[test]
+fn home_and_end_bring_the_playhead_into_view() {
+    let mut d = Driver::demo();
+    d.ok("ui.set", json!({"timeline": {"pps": 400.0, "scroll": 3.0}}));
+    d.frames(3);
+    d.exec("playhead.start", json!({}));
+    d.frames(3);
+    assert_eq!(d.app().ui.timeline.target_scroll, 0.0, "Home scrolls back to the start");
+    d.exec("playhead.end", json!({}));
+    d.frames(3);
+    let end = d.app().session.playhead().seconds();
+    let v = &d.app().ui.timeline;
+    let width = 1600.0 / v.pps;
+    assert!(v.target_scroll > 3.0 && v.target_scroll <= end && end - v.target_scroll < width, "End shows the playhead: scroll {} end {end}", v.target_scroll);
+}
+
+fn repeated_endpoint_navigation_reveals_the_same_playhead(use_keys: bool) {
+    let mut d = Driver::demo();
+    let project = d.app().session.project.clone();
+    let undo = d.app().session.history.undo.len();
+    for (command, key, manual_scroll) in [("playhead.start", "Home", 5.0), ("playhead.end", "End", 0.0)] {
+        d.exec(command, json!({}));
+        d.frames(3);
+        let playhead = d.app().session.playhead();
+        d.ok("ui.set", json!({"timeline": {"pps": 400.0, "scroll": manual_scroll}}));
+        d.frames(3);
+        assert_eq!(d.view().0, manual_scroll, "manual browsing is allowed while stopped");
+        if use_keys {
+            d.ok("ui.key", json!({"key": key}));
+        } else {
+            d.exec(command, json!({}));
+        }
+        d.frames(3);
+        let (scroll, pps, ..) = d.view();
+        let x = (playhead.seconds() - scroll) * pps;
+        let width = f64::from(d.app().last_timeline_width);
+        assert!((0.0..=width).contains(&x), "{key} reveals an unchanged playhead: x={x}, width={width}, scroll={scroll}");
+        assert_eq!(d.app().session.playhead(), playhead);
+        assert!(std::sync::Arc::ptr_eq(&project, &d.app().session.project));
+        assert_eq!(d.app().session.history.undo.len(), undo);
+        // An explicit navigation must not turn later manual browsing into continuous following.
+        d.ok("ui.set", json!({"timeline": {"scroll": manual_scroll}}));
+        d.frames(3);
+        assert_eq!(d.view().0, manual_scroll);
+    }
+}
+
+#[test]
+fn repeated_home_and_end_keys_reveal_a_playhead_already_at_the_endpoint() {
+    repeated_endpoint_navigation_reveals_the_same_playhead(true);
+}
+
+#[test]
+fn repeated_start_and_end_commands_reveal_a_playhead_already_at_the_endpoint() {
+    repeated_endpoint_navigation_reveals_the_same_playhead(false);
+}

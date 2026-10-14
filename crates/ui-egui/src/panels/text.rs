@@ -16,6 +16,15 @@ use crate::theme::Tokens;
 
 const TABS: [&str; 3] = ["Transcript", "Captions", "Graphics"];
 
+/// The width a tab label needs: 7 px per character, which the strip was laid out with for Latin
+/// text, or the label as drawn if that is wider (Japanese glyphs are about twice as wide, and a
+/// per-character estimate alone let a label run into the next tab). Measured in the semibold the
+/// active tab uses, so selecting a tab does not move its neighbours.
+fn tab_text_width(painter: &egui::Painter, label: &str) -> f32 {
+    let drawn = painter.layout_no_wrap(label.to_string(), Tokens::semibold(12.5), Color32::WHITE).size().x;
+    (label.chars().count() as f32 * 7.0).max(drawn)
+}
+
 pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let t = app.tokens;
     ui.painter().rect_filled(rect, 0.0, t.panel_bg);
@@ -23,7 +32,8 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let mut x = rect.min.x + 12.0;
     for tab in TABS {
         let shown = crate::i18n::t(tab);
-        let w = shown.chars().count() as f32 * 7.0 + 16.0;
+        let text_w = tab_text_width(ui.painter(), shown);
+        let w = text_w + 16.0;
         let r = Rect::from_min_size(pos2(x, rect.min.y + 4.0), vec2(w, 24.0));
         let resp = ui.interact(r, egui::Id::new(("text-tab", tab)), Sense::click());
         let active = app.ui.text_tab == tab;
@@ -35,7 +45,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             if active { t.text } else { t.text_dim },
         );
         if active {
-            ui.painter().line_segment([pos2(r.min.x, r.max.y), pos2(r.min.x + w - 16.0, r.max.y)], Stroke::new(2.0, t.text));
+            ui.painter().line_segment([pos2(r.min.x, r.max.y), pos2(r.min.x + text_w, r.max.y)], Stroke::new(2.0, t.text));
         }
         app.auto.add(&format!("text.tab.{tab}"), r, tab);
         if resp.clicked() {
@@ -64,7 +74,8 @@ fn tool_button(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, icon: Icon, i
 
 fn captions(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let t = app.tokens;
-    let Some(seq) = app.session.active_sequence().cloned() else {
+    let project = app.session.project.clone();
+    let Some(seq) = app.session.state.active_sequence.and_then(|id| project.sequence(id)) else {
         crate::dock::placeholder(ui, rect, &t, tl!("Open a sequence to work with captions"));
         return;
     };
@@ -84,7 +95,7 @@ fn captions(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let r = Rect::from_center_size(c + vec2(0.0, 26.0 + i as f32 * 34.0), vec2(200.0, 26.0));
             let resp = ui.interact(r, egui::Id::new(id), Sense::click());
             ui.painter().rect_filled(r, 13.0, if i == 0 { if resp.hovered() { t.accent_hover } else { t.accent } } else { t.field_bg });
-            ui.painter().text(r.center(), Align2::CENTER_CENTER, label, Tokens::semibold(12.0), Color32::WHITE);
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, label, Tokens::semibold(12.0), if i == 0 { Color32::WHITE } else { t.text });
             app.auto.add(id, r, label);
             if resp.clicked() {
                 actions.push((cmd.into(), json!({})));
@@ -223,14 +234,18 @@ fn captions(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         }
                         let key = egui::Id::new(("cap-text", c.id.0));
                         let mut buf = ui.data(|d| d.get_temp::<String>(key)).unwrap_or_else(|| c.text.clone());
-                        let resp = ui.add(
-                            egui::TextEdit::multiline(&mut buf)
-                                .id(key.with("te"))
-                                .desired_rows(1)
-                                .desired_width(ui.available_width())
-                                .font(Tokens::ui(12.5))
-                                .frame(egui::Frame::NONE),
-                        );
+                        let resp = if crate::rtl::has_rtl(&buf) && !ui.memory(|m| m.has_focus(key.with("te"))) {
+                            reading_order(ui, &buf, key.with("te"))
+                        } else {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut buf)
+                                    .id(key.with("te"))
+                                    .desired_rows(1)
+                                    .desired_width(ui.available_width())
+                                    .font(Tokens::ui(12.5))
+                                    .frame(egui::Frame::NONE),
+                            )
+                        };
                         app.auto.add(&format!("text.captions.{}.text", c.id.0), resp.rect, "Caption text");
                         if resp.has_focus() {
                             ui.data_mut(|d| d.insert_temp(key, buf.clone()));
@@ -267,6 +282,22 @@ fn captions(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     run(app, ui, actions);
 }
 
+/// A caption's text in reading order ([`crate::rtl::Lines`]) in place of its `TextEdit`, which
+/// shows right-to-left words in logical order. A click hands focus to the `TextEdit` (`id`), so the
+/// text is edited in logical order and shown in reading order again when the field loses focus.
+fn reading_order(ui: &mut egui::Ui, text: &str, id: egui::Id) -> egui::Response {
+    let margin = vec2(4.0, 2.0); // a TextEdit's own margin, so the text does not move on focus
+    let color = ui.visuals().widgets.inactive.text_color();
+    let width = ui.available_width();
+    let lines = crate::rtl::Lines::new(ui.painter(), text, Tokens::ui(12.5), color, (width - 2.0 * margin.x).max(0.0));
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, lines.size.y + 2.0 * margin.y), Sense::click());
+    lines.paint(ui.painter(), rect.shrink2(margin), color);
+    if resp.clicked() {
+        ui.memory_mut(|m| m.request_focus(id));
+    }
+    resp.on_hover_cursor(egui::CursorIcon::Text)
+}
+
 fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let t = app.tokens;
     if app.session.active_sequence().is_none() {
@@ -274,7 +305,8 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         return;
     }
     let mut actions: Vec<(String, Value)> = Vec::new();
-    let words = filmcraft_engine::transcript::sequence_words(&app.session);
+    let content = app.transcript_cache.content(&app.session);
+    let words = &content.words;
     if words.is_empty() {
         let c = rect.center();
         icons::paint(ui.painter(), Rect::from_center_size(c - vec2(0.0, 70.0), vec2(40.0, 40.0)), Icon::Captions, t.text_dim);
@@ -305,7 +337,7 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(bar.min, vec2(sw, 24.0))));
     let sresp = crate::widgets::search_field(&mut child, &mut app.ui.transcript_search, tl!("Search"), sw, &t);
     app.auto.add("text.transcript.search", sresp.rect, "Search transcript");
-    let hits: Vec<std::ops::Range<usize>> = filmcraft_edit::transcript::search(&words, &app.ui.transcript_search);
+    let highlights = app.transcript_cache.highlights(&app.ui.transcript_search);
     let mut x = bar.min.x + sw + 10.0;
     let range = sel.map(|(a, b)| json!({"from": a.min(b), "to": a.max(b)}));
     let tools: [(Icon, &str, &str, bool, &str, Value); 4] = [
@@ -332,8 +364,8 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let list = Rect::from_min_max(pos2(rect.min.x + 6.0, bar.max.y + 8.0), pos2(rect.max.x - 6.0, rect.max.y - 4.0));
     ui.painter().rect_filled(list, 3.0, t.app_bg);
     let ph = app.session.playhead();
-    let current = filmcraft_edit::transcript::word_at(&words, ph);
-    let paras = filmcraft_edit::transcript::paragraphs(&words, filmcraft_time::Tick::from_seconds_f64(1.5));
+    let current = filmcraft_edit::transcript::word_at(words, ph);
+    let paras = &content.paragraphs;
     let rate = app.session.sequence_rate();
     let df = app.session.active_sequence().is_some_and(|q| q.settings.drop_frame);
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(list.shrink(6.0)).id_salt("transcript-list"));
@@ -349,7 +381,7 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 for i in pr.clone() {
                     let w = &words[i];
                     let in_sel = sa.is_some_and(|a| i >= a) && sb.is_some_and(|b| i <= b);
-                    let hit = hits.iter().any(|h| h.contains(&i));
+                    let hit = highlights.get(i).copied().unwrap_or(false);
                     let mut text = egui::RichText::new(&w.text).size(13.0).color(if Some(i) == current { t.hot_text } else { t.text });
                     if in_sel {
                         text = text.background_color(t.row_selected);
@@ -385,10 +417,30 @@ fn style_strip(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, track_idx: us
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r).id_salt("caption-style"));
     child.horizontal_centered(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
+        let r = egui::ComboBox::from_id_salt(("caption-font", tr.id.0)).selected_text(&st.font).width(130.0).height(400.0).show_ui(ui, |ui| {
+            if !filmcraft_text::fonts::system_scanned() {
+                filmcraft_text::fonts::scan_system();
+            }
+            // names starting with '.' are macOS-private system faces (UI/fallback fonts, some without a space glyph)
+            for (f, _) in filmcraft_text::families().into_iter().filter(|(f, _)| !f.starts_with('.')) {
+                let resp = ui.selectable_label(f.eq_ignore_ascii_case(&st.font), &f);
+                // An edge row may be only partly visible; automation must click its visible portion.
+                let visible = resp.rect.intersect(ui.clip_rect());
+                if visible.is_positive() {
+                    app.auto.add(&format!("text.captions.style.font.option.{f}"), visible, &f);
+                }
+                if resp.clicked() {
+                    actions.push(("captions.setStyle".into(), json!({"track": tr.id.0, "font": f})));
+                }
+            }
+        });
+        app.auto.add("text.captions.style.font", r.response.rect, "Caption font");
         let mut size = st.size;
-        let resp = ui.add(egui::DragValue::new(&mut size).range(8.0..=200.0).speed(0.5).suffix(" px"));
+        let resp = ui.add(crate::widgets::number_drag(&mut size).range(8.0..=200.0).speed(0.5).suffix(" px"));
         app.auto.add("text.captions.style.size", resp.rect, "Caption size");
-        if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
+        // a drag ended by Escape keeps the size it had (#580)
+        let escaped = resp.drag_stopped() && ui.input(|i| i.key_pressed(egui::Key::Escape));
+        if !escaped && (resp.drag_stopped() || (resp.changed() && !resp.dragged())) {
             actions.push(("captions.setStyle".into(), json!({"track": tr.id.0, "size": size})));
         }
         let mut col = Color32::from_rgba_unmultiplied(st.color[0], st.color[1], st.color[2], st.color[3]);
@@ -436,6 +488,40 @@ fn run(app: &mut FilmcraftApp, ui: &egui::Ui, actions: Vec<(String, Value)>) {
     for (cmd, p) in actions {
         if let Err(e) = crate::menus::invoke(app, &ctx, &cmd, p) {
             app.ui.status = e;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Latin labels keep the 7 px per character they were laid out with; Japanese labels are as
+    /// wide as they are drawn, so they no longer run into the next tab.
+    #[test]
+    fn tab_widths_follow_the_drawn_label() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx, &Tokens::for_kind(crate::theme::ThemeKind::default()));
+        // Japanese needs a craft-fonts build or an installed font; without one there is nothing wide to measure
+        if !crate::i18n::install_japanese_font(&ctx) {
+            return;
+        }
+        let labels = ["Transcript", "Captions", "Graphics", "文字起こし", "キャプション", "グラフィックス"];
+        let mut widths = Vec::new();
+        for _ in 0..2 {
+            // the added font is in place from the second pass
+            widths.clear();
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                for label in labels {
+                    widths.push(tab_text_width(ui.painter(), label));
+                }
+            });
+            out.textures_delta.clear();
+        }
+        assert_eq!(widths[..3], [70.0, 56.0, 56.0], "Latin tabs keep 7 px per character");
+        // 5, 6 and 7 Japanese characters of about 12.5 px each, far over the 7 px per character estimate
+        for ((width, chars), label) in widths[3..].iter().zip([5.0_f32, 6.0, 7.0]).zip(&labels[3..]) {
+            assert!(*width > chars * 7.0 * 1.5, "{label}: {width} px");
         }
     }
 }
